@@ -77,6 +77,8 @@ message ComputeRef {
 }
 
 message Session {
+  // Mandatory opaque whole-execution input; immutable for this session.
+  bytes execution_requirement = 18;
   ResourceMetadata metadata = 1;
   string harness = 2;
   string model = 3; // model-agnostic id

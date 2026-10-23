@@ -21,6 +21,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
+	"syscall"
 
 	"github.com/agent-primitives/sessions/api"
 	v1 "github.com/agent-primitives/sessions/api/genpb"
@@ -33,11 +36,27 @@ import (
 // Server serves an api.Harness over the Harness gRPC service.
 type Server struct {
 	v1.UnimplementedHarnessServer
-	harness api.Harness
+	harness     api.Harness
+	nativeModel func(context.Context, api.ModelRequest) (api.ModelResponse, error)
+	nativeTool  func(context.Context, api.ToolCall) (api.ToolResult, error)
 }
 
 // NewServer wraps h as a HarnessServer.
 func NewServer(h api.Harness) *Server { return &Server{harness: h} }
+
+// NewNativeServer keeps provider IO in the harness process. The normal
+// controller still journals before granting each live call and serves replay.
+// The caller must place this entire server and provider inside owned compute.
+func NewNativeServer(h api.Harness, model func(context.Context, api.ModelRequest) (api.ModelResponse, error)) *Server {
+	return &Server{harness: h, nativeModel: model}
+}
+
+// NewNativeToolServer keeps both provider and tool IO in the owned harness
+// process. It does not contain that process; the caller must use owning compute.
+// No tool callback is granted on replay. Approval-gated native tools are not supported.
+func NewNativeToolServer(h api.Harness, model func(context.Context, api.ModelRequest) (api.ModelResponse, error), tool func(context.Context, api.ToolCall) (api.ToolResult, error)) *Server {
+	return &Server{harness: h, nativeModel: model, nativeTool: tool}
+}
 
 // Describe returns the harness's static contract.
 func (s *Server) Describe(ctx context.Context, _ *v1.DescribeRequest) (*v1.HarnessDescriptor, error) {
@@ -67,7 +86,7 @@ func (s *Server) Connect(stream v1.Harness_ConnectServer) error {
 	done := make(chan struct{})
 	go receiveFrames(stream, results, done)
 
-	sink := &streamSink{stream: stream, results: results, executionID: executionID, session: first.GetSession(), done: done}
+	sink := &streamSink{stream: stream, results: results, executionID: executionID, session: first.GetSession(), done: done, nativeModel: s.nativeModel, nativeTool: s.nativeTool}
 	runStart := startFromProto(start)
 	runStart.ExecutionID = executionID
 	runStart.SessionUID = first.GetSession()
@@ -116,6 +135,8 @@ func (s *Server) Connect(stream v1.Harness_ConnectServer) error {
 // streamSink is the harness-side EventSink: each op becomes an Event on the wire; Model/ToolCall
 // then block for the host's reply frame.
 type streamSink struct {
+	nativeModel func(context.Context, api.ModelRequest) (api.ModelResponse, error)
+	nativeTool  func(context.Context, api.ToolCall) (api.ToolResult, error)
 	stream      v1.Harness_ConnectServer
 	results     <-chan *v1.ControllerFrame
 	executionID string
@@ -245,6 +266,7 @@ func (s *streamSink) Model(ctx context.Context, req api.ModelRequest) (api.Model
 			Messages:   messagesToProto(req.Messages),
 			Tools:      wire.ToolDefinitionsToProto(req.Tools),
 			ToolChoice: choice,
+			Native:     s.nativeModel != nil,
 		}},
 	}
 	if err := s.stream.Send(ev); err != nil {
@@ -253,6 +275,23 @@ func (s *streamSink) Model(ctx context.Context, req api.ModelRequest) (api.Model
 	frame, err := s.awaitResult(ctx)
 	if err != nil {
 		return api.ModelResponse{}, err
+	}
+	if grant := frame.GetNativeModelCallId(); grant != "" {
+		if grant != id || s.nativeModel == nil || frame.GetSession() != s.session {
+			return api.ModelResponse{}, s.fail(errors.New("harnesswire: invalid native model grant"))
+		}
+		result, callErr := s.nativeModel(ctx, req)
+		completion := &v1.NativeModelCompletion{ModelCallId: id, Message: wire.MessageToProto(&result.Message), Usage: usageResultToProto(result.Usage)}
+		if callErr != nil {
+			completion.Error = "native provider invocation failed"
+		}
+		if err := s.stream.Send(&v1.Event{ExecutionId: s.executionID, Kind: v1.EventKind_EVENT_NATIVE_MODEL_RESULT, Body: &v1.Event_NativeModel{NativeModel: completion}}); err != nil {
+			return api.ModelResponse{}, s.fail(err)
+		}
+		frame, err = s.awaitResult(ctx)
+		if err != nil {
+			return api.ModelResponse{}, s.fail(err)
+		}
 	}
 	mr := frame.GetModel()
 	if mr == nil {
@@ -307,6 +346,11 @@ func (s *streamSink) ToolCall(ctx context.Context, tc api.ToolCall) (api.ToolRes
 		return api.ToolResult{}, err
 	}
 	call := tc
+	// Explicit server configuration chooses placement, never a caller callback.
+	call.Native = s.nativeTool != nil
+	if call.Native && (call.ID == "" || call.Mediation != api.MediationControllerMediated) {
+		return api.ToolResult{}, s.fail(errors.New("native tool requires ordinary exact call without approval"))
+	}
 	if call.Mediation == api.MediationRequiresApproval && (s.session == "" || call.ID == "") {
 		return api.ToolResult{}, s.fail(errors.New("harnesswire: approval requires session and call id"))
 	}
@@ -323,6 +367,40 @@ func (s *streamSink) ToolCall(ctx context.Context, tc api.ToolCall) (api.ToolRes
 	}
 	if frame.GetSession() != s.session {
 		return api.ToolResult{}, s.fail(errors.New("harnesswire: tool result session mismatch"))
+	}
+	if grant := frame.GetNativeToolCallId(); grant != "" {
+		if !call.Native || s.nativeTool == nil || grant != call.ID || frame.GetSession() != s.session {
+			return api.ToolResult{}, s.fail(errors.New("harnesswire: invalid native tool grant"))
+		}
+		result, callErr := s.nativeTool(ctx, call)
+		result.ID = call.ID
+		completion := &v1.NativeToolCompletion{ToolCallId: call.ID, Result: wire.ToolResultToProto(&result)}
+		if callErr != nil {
+			// Local native failure observation, NOT an enforcement receipt.
+			// Do not expose arbitrary provider/tool error strings or arguments.
+			errno := 0
+			if errors.Is(callErr, syscall.EPERM) {
+				errno = int(syscall.EPERM)
+			}
+			if errors.Is(callErr, syscall.EACCES) {
+				errno = int(syscall.EACCES)
+			}
+			slog.New(slog.NewJSONHandler(os.Stderr, nil)).Info("native tool failure",
+				"native_tool_failure", true, "session_uid", s.session,
+				"execution_id", s.executionID, "tool_call_id", call.ID,
+				"native_errno", errno, "context_failed", ctx.Err() != nil)
+			completion.Error = "native tool invocation failed"
+		}
+		if err := s.stream.Send(&v1.Event{ExecutionId: s.executionID, Kind: v1.EventKind_EVENT_NATIVE_TOOL_RESULT, Body: &v1.Event_NativeTool{NativeTool: completion}}); err != nil {
+			return api.ToolResult{}, s.fail(err)
+		}
+		frame, err = s.awaitResult(ctx)
+		if err != nil {
+			return api.ToolResult{}, s.fail(err)
+		}
+		if frame.GetSession() != s.session {
+			return api.ToolResult{}, s.fail(errors.New("harnesswire: native tool result session mismatch"))
+		}
 	}
 	var approval *api.ApprovalResult
 	if call.Mediation == api.MediationRequiresApproval {
@@ -457,13 +535,44 @@ func (h *ClientHarness) Run(ctx context.Context, start *api.Start, sink api.Even
 			if err != nil {
 				return fmt.Errorf("harnesswire: model call %q: %w", mc.GetId(), err)
 			}
-			resp, err := sink.Model(ctx, api.ModelRequest{
+			request := api.ModelRequest{
 				Model:      mc.GetModel(),
 				Params:     mc.GetParams(),
 				Messages:   messagesFromProto(mc.GetMessages()),
 				Tools:      wire.ToolDefinitionsFromProto(mc.GetTools()),
 				ToolChoice: choice,
-			})
+				Native:     mc.GetNative(),
+			}
+			if mc.GetNative() {
+				request.InvokeNative = func(callCtx context.Context) (api.ModelResponse, error) {
+					if err := callCtx.Err(); err != nil {
+						return api.ModelResponse{}, err
+					}
+					if mc.GetId() == "" {
+						return api.ModelResponse{}, errors.New("harnesswire: native model requires correlation ID")
+					}
+					if err := stream.Send(&v1.ControllerFrame{Session: start.SessionUID, ExecutionId: start.ExecutionID, Frame: &v1.ControllerFrame_NativeModelCallId{NativeModelCallId: mc.GetId()}}); err != nil {
+						return api.ModelResponse{}, err
+					}
+					result, err := stream.Recv()
+					if err != nil {
+						return api.ModelResponse{}, err
+					}
+					completion := result.GetNativeModel()
+					if result.GetExecutionId() != start.ExecutionID || result.GetKind() != v1.EventKind_EVENT_NATIVE_MODEL_RESULT || completion == nil || completion.GetModelCallId() != mc.GetId() {
+						return api.ModelResponse{}, errors.New("harnesswire: native model result correlation mismatch")
+					}
+					if completion.GetError() != "" {
+						return api.ModelResponse{}, errors.New("native provider invocation failed")
+					}
+					message := wire.MessageFromProto(completion.GetMessage())
+					if message == nil {
+						return api.ModelResponse{}, errors.New("native provider completion missing")
+					}
+					return api.ModelResponse{Message: *message, Usage: usageResultFromProto(completion.GetUsage())}, nil
+				}
+			}
+			resp, err := sink.Model(ctx, request)
 			if err != nil {
 				return err
 			}
@@ -491,6 +600,38 @@ func (h *ClientHarness) Run(ctx context.Context, start *api.Start, sink api.Even
 			}
 			if tc.Mediation == api.MediationRequiresApproval && (start.SessionUID == "" || tc.ID == "") {
 				return errors.New("harnesswire: approval requires session and call id")
+			}
+			if tc.Native {
+				if tc.ID == "" || tc.Mediation != api.MediationControllerMediated {
+					return errors.New("harnesswire: invalid native tool request")
+				}
+				tc.InvokeNative = func(ctx context.Context) (api.ToolResult, error) {
+					if err := ctx.Err(); err != nil {
+						return api.ToolResult{}, err
+					}
+					if err := stream.Send(&v1.ControllerFrame{Session: start.SessionUID, ExecutionId: start.ExecutionID, Frame: &v1.ControllerFrame_NativeToolCallId{NativeToolCallId: tc.ID}}); err != nil {
+						return api.ToolResult{}, err
+					}
+					result, err := stream.Recv()
+					if err != nil {
+						return api.ToolResult{}, err
+					}
+					completion := result.GetNativeTool()
+					if result.GetExecutionId() != start.ExecutionID || result.GetKind() != v1.EventKind_EVENT_NATIVE_TOOL_RESULT || completion == nil || completion.GetToolCallId() != tc.ID {
+						return api.ToolResult{}, errors.New("harnesswire: native tool completion correlation mismatch")
+					}
+					if completion.GetError() != "" {
+						return api.ToolResult{}, errors.New("native tool invocation failed")
+					}
+					response := wire.ToolResultFromProto(completion.GetResult())
+					if response == nil || response.ID != tc.ID {
+						return api.ToolResult{}, errors.New("harnesswire: native tool completion missing or mismatched")
+					}
+					if err := rejectApprovalReport(*response); err != nil {
+						return api.ToolResult{}, err
+					}
+					return *response, nil
+				}
 			}
 			res, err := sink.ToolCall(ctx, *tc)
 			if err != nil {
@@ -553,6 +694,8 @@ func (h *ClientHarness) Run(ctx context.Context, start *api.Start, sink api.Even
 					return err
 				}
 			}
+		case v1.EventKind_EVENT_NATIVE_MODEL_RESULT, v1.EventKind_EVENT_NATIVE_TOOL_RESULT:
+			return errors.New("harnesswire: unsolicited native completion")
 		case v1.EventKind_EVENT_APPROVAL_REQUEST, v1.EventKind_EVENT_APPROVAL_RESULT, v1.EventKind_EVENT_EXECUTION_START, v1.EventKind_EVENT_PARKED:
 			return fmt.Errorf("harnesswire: harness emitted host-owned control event %s", ev.GetKind())
 		case v1.EventKind_EVENT_END:
@@ -742,4 +885,11 @@ func usageResultToProto(u api.Usage) *v1.Usage {
 		OutputTokens:    u.OutputTokens,
 		ReasoningTokens: u.ReasoningTokens,
 	}
+}
+
+func usageResultFromProto(u *v1.Usage) api.Usage {
+	if u == nil {
+		return api.Usage{}
+	}
+	return api.Usage{Model: u.GetModel(), InputTokens: u.GetInputTokens(), OutputTokens: u.GetOutputTokens(), ReasoningTokens: u.GetReasoningTokens()}
 }

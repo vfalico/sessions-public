@@ -6,6 +6,7 @@
 package placement
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -171,12 +172,19 @@ func WithDialer(d Dialer) Option { return func(p *Placer) { p.dial = d } }
 type ExecOption func(*execConfig)
 
 type execConfig struct {
-	harness       string
-	observer      controller.Observer
-	config        []byte
-	resumeFromSeq int64
-	deadline      time.Time
-	override      bool
+	executionRequirement []byte
+	harness              string
+	observer             controller.Observer
+	config               []byte
+	resumeFromSeq        int64
+	deadline             time.Time
+	override             bool
+}
+
+// WithExecutionRequirement freezes exact bytes before provisioning.
+func WithExecutionRequirement(raw []byte) ExecOption {
+	frozen := append([]byte(nil), raw...)
+	return func(c *execConfig) { c.executionRequirement = append([]byte(nil), frozen...) }
 }
 
 // WithHarness records the resolved registry name for this execution. Without a name, the
@@ -334,6 +342,12 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 	for _, o := range opts {
 		o(&cfg)
 	}
+	// Isolating a harness does not contain host controller callbacks. This
+	// version cannot bind those callbacks to the execution's exact target.
+	// Refuse before Describe, Create, log writes or callback dispatch.
+	if len(cfg.executionRequirement) != 0 && (p.model != nil || p.stream != nil || p.tool != nil) {
+		return inc, fmt.Errorf("%w: mandatory execution requirement cannot cover host model/tool callbacks", ErrUnplaceable)
+	}
 	if !cfg.deadline.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, cfg.deadline)
@@ -383,9 +397,139 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 	// turns this Placer ran count: a turn ExecRequest.harness sent to another harness left no state in
 	// this one's compute. The backend counts when it has seen the compute is missing, not here, so a
 	// turn another host journals in between is not missed (see api.SessionSpec.StartedTurns).
-	spec := &api.SessionSpec{SessionUID: sessionUID, StartedTurns: func() (int, error) {
+	spec := &api.SessionSpec{SessionUID: sessionUID, ExecutionRequirement: append([]byte(nil), cfg.executionRequirement...), StartedTurns: func() (int, error) {
 		return p.startedTurns(log)
 	}}
+	if len(spec.ExecutionRequirement) != 0 {
+		if _, ok := p.backend.(api.ExecutionRequirementRuntime); !ok {
+			return inc, fmt.Errorf("%w: owning backend does not support mandatory execution requirements", ErrUnplaceable)
+		}
+	}
+	var retained api.Incarnation
+	if len(spec.ExecutionRequirement) != 0 {
+		if e := log.Verify(); e != nil {
+			return inc, fmt.Errorf("verify original compute authority: %w", e)
+		}
+		records, e := log.Read(1)
+		if e != nil {
+			return inc, fmt.Errorf("read original compute authority: %w", e)
+		}
+		spec.ExpectedComputeInstance, _ = controller.LatestComputeInstance(records, p.ranHere)
+		// An owner-side operation is retained BEFORE its creating RPC. It is not
+		// a target UID, current enforcement acknowledgement or dispatch authority.
+		name := cfg.harness
+		if name == "" {
+			name = desc.ID
+		}
+		if owner, ok := p.backend.(api.ExecutionOperationRuntime); ok {
+			var operation []byte
+			for _, record := range records {
+				e := record.Event
+				if e.Kind == api.EventLifecycle && e.Lifecycle != nil && e.Lifecycle.Kind == api.LifecycleFork {
+					operation = nil
+				}
+				if e.Kind == api.EventLifecycle && e.Lifecycle != nil && e.Lifecycle.Kind == api.LifecycleComputePrepared && e.Lifecycle.ComputeHarness == name {
+					l := e.Lifecycle
+					if l.ComputeID != sessionUID || !bytes.Equal(l.ComputeRequirement, spec.ExecutionRequirement) || len(l.ComputeOperation) == 0 {
+						return inc, fmt.Errorf("prepared compute operation changed")
+					}
+					if len(operation) > 0 && !bytes.Equal(operation, l.ComputeOperation) {
+						return inc, fmt.Errorf("multiple original compute operations")
+					}
+					operation = append([]byte(nil), l.ComputeOperation...)
+				}
+			}
+			if len(operation) == 0 && spec.ExpectedComputeInstance == "" {
+				operation, err = owner.PrepareExecutionOperation(sessionUID, append([]byte(nil), spec.ExecutionRequirement...))
+				if err != nil {
+					return inc, err
+				}
+				if len(operation) == 0 {
+					return inc, fmt.Errorf("backend prepared empty compute operation")
+				}
+				fence, e := log.NewFence()
+				if e != nil {
+					return inc, e
+				}
+				record, e := log.Append(expectedLastSeq, fence, api.Event{Kind: api.EventLifecycle, SchemaVersion: 1, Lifecycle: &api.Lifecycle{Kind: api.LifecycleComputePrepared, ComputeID: sessionUID, ComputeHarness: name, ComputeRequirement: append([]byte(nil), spec.ExecutionRequirement...), ComputeOperation: append([]byte(nil), operation...)}})
+				if e != nil {
+					return inc, e
+				}
+				expectedLastSeq = record.Seq
+				if cfg.observer.OnRecord != nil {
+					cfg.observer.OnRecord(record)
+				}
+			}
+			spec.ComputeOperation = append([]byte(nil), operation...)
+		}
+		originalInstance := spec.ExpectedComputeInstance
+		// Persist original suspended authority before the owning backend may
+		// resume. This lifecycle record is cleanup-only, never dispatch proof.
+		spec.RetainCompute = func(owned api.Incarnation) error {
+			if retained.ComputeInstance != "" {
+				return fmt.Errorf("compute authority already retained")
+			}
+			if originalInstance != "" && owned.ComputeInstance != originalInstance {
+				return fmt.Errorf("original compute authority changed before retention")
+			}
+			if owned.ID != sessionUID || owned.ComputeInstance == "" || owned.Runtime == "" || !bytes.Equal(owned.ExecutionRequirement, spec.ExecutionRequirement) {
+				return fmt.Errorf("invalid original compute ownership")
+			}
+			name := cfg.harness
+			if name == "" {
+				name = desc.ID
+			}
+			if name == "" {
+				return fmt.Errorf("compute ownership has no resolved harness")
+			}
+			// The caller's original CAS is used, not a newly observed head.
+			fence, e := log.NewFence()
+			if e != nil {
+				return e
+			}
+			record, e := log.Append(expectedLastSeq, fence, api.Event{Kind: api.EventLifecycle, SchemaVersion: 1, Lifecycle: &api.Lifecycle{Kind: api.LifecycleComputeOwned, ComputeID: owned.ID, ComputeRuntime: owned.Runtime, ComputeHarness: name, ComputeInstance: owned.ComputeInstance, ComputeRequirement: append([]byte(nil), spec.ExecutionRequirement...)}})
+			if e != nil {
+				return e
+			}
+			expectedLastSeq = record.Seq
+			retained = owned
+			retained.ExecutionRequirement = append([]byte(nil), owned.ExecutionRequirement...)
+			if cfg.observer.OnRecord != nil {
+				cfg.observer.OnRecord(record)
+			}
+			return nil
+		}
+		// Even Create returning an error may have allocated original compute.
+		// Only an exact owner-reported identity is eligible for teardown.
+		defer func() {
+			if err == nil {
+				return
+			}
+			if owner, ok := p.backend.(api.ExecutionOperationRuntime); ok && len(spec.ComputeOperation) > 0 {
+				// Retire the operation even when Create's reply contained no UID. A
+				// name lookup/Stop alone cannot cancel an RPC still committing remotely.
+				cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				if retireErr := owner.RetireExecutionOperation(cleanup, append([]byte(nil), spec.ComputeOperation...)); retireErr != nil {
+					err = errors.Join(err, fmt.Errorf("original compute operation retirement remains pending: %w", retireErr))
+				}
+				return
+			}
+			owned := retained
+			if owned.ComputeInstance == "" {
+				owned = inc
+			}
+			if owned.ID != sessionUID || owned.ComputeInstance == "" {
+				return
+			}
+			owned.ExecutionRequirement = append([]byte(nil), spec.ExecutionRequirement...)
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if stopErr := p.backend.Stop(cleanup, owned); stopErr != nil {
+				err = errors.Join(err, fmt.Errorf("governed compute retirement remains pending: %w", stopErr))
+			}
+		}()
+	}
 	createFinished := observability.StartDebug(ctx, p.logger, "placement", "create_compute",
 		"session_uid", sessionUID)
 	inc, err = p.backend.Create(ctx, spec)
@@ -394,6 +538,16 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 		return inc, err
 	}
 	createFinished(nil, "incarnation_id", inc.ID, "runtime", inc.Runtime)
+
+	// Once governed compute exists, every failed launch/turn must attempt exact
+	// destructive teardown. A cancelled stream is not proof that its native
+	// provider or descendants stopped. Keep the owning runtime's exact identity
+	// and use a separate bounded cleanup context; never rediscover by name.
+	if len(spec.ExecutionRequirement) != 0 {
+		if inc.ID == "" || inc.ComputeInstance == "" {
+			return inc, fmt.Errorf("governed compute returned no exact retirement identity; ownership retained")
+		}
+	}
 
 	dialFinished := observability.StartDebug(ctx, p.logger, "placement", "dial_harness",
 		"session_uid", sessionUID,

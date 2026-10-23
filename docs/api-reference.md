@@ -144,6 +144,8 @@ transport (see Delta in session.proto) and coalesce into the finalized event (§
 | error | [Error](#agentsessions-v1-Error) |  |  |
 | execution_start | [ExecutionStart](#agentsessions-v1-ExecutionStart) |  |  |
 | parked | [ApprovalRef](#agentsessions-v1-ApprovalRef) |  | EVENT_PARKED echoes the park reference; Event.execution_id must match its execution_id. |
+| native_model | [NativeModelCompletion](#agentsessions-v1-NativeModelCompletion) |  |  |
+| native_tool | [NativeToolCompletion](#agentsessions-v1-NativeToolCompletion) |  |  |
 | actor | [IdentityRef](#agentsessions-v1-IdentityRef) |  | emitter principal -&gt; provenance |
 
 
@@ -243,7 +245,11 @@ compaction checkpoint (§1).
 | snapshot_external_uri | [string](#string) |  |  |
 | snapshot_memory | [bool](#bool) |  |  |
 | snapshot_sealed | [bool](#bool) |  |  |
-| compute_instance | [string](#string) |  | Set only on FORK: the identity of the compute instance the child was cloned onto, in the same form as ExecutionStart.compute_instance (substrate: the cloned actor&#39;s UID). The child&#39;s turns are compared with it until the child records one of its own, so a turn, Resume, Suspend or Fork placed on another instance before the child&#39;s first turn is refused. Empty means not recorded (a stateless fork, or a marker written before this field existed), and the child&#39;s first turn is not compared. |
+| compute_instance | [string](#string) |  | Set on COMPUTE_OWNED for exact suspended cleanup authority, or on FORK for the identity of the compute instance the child was cloned onto, in the same form as ExecutionStart.compute_instance (substrate: the cloned actor&#39;s UID). The child&#39;s turns are compared with it until the child records one of its own, so a turn, Resume, Suspend or Fork placed on another instance before the child&#39;s first turn is refused. Empty means not recorded (a stateless fork, or a marker written before this field existed), and the child&#39;s first turn is not compared. |
+| compute_id | [string](#string) |  | COMPUTE_OWNED only: original incarnation handle, never a workload identity. |
+| compute_runtime | [string](#string) |  | COMPUTE_OWNED only: owning runtime label; opaque to the session controller. |
+| compute_harness | [string](#string) |  | COMPUTE_OWNED only: resolved host registry name, not harness self-assertion. |
+| compute_requirement | [bytes](#bytes) |  | COMPUTE_OWNED only: frozen original requirement. No active-policy authority. |
 
 
 
@@ -307,6 +313,7 @@ message. Under STATELESS_REPLAY the harness never calls a provider directly.
 | messages | [Message](#agentsessions-v1-Message) | repeated | messages is the request context the host needs to INVOKE the model on the live path. It is wire-only: the host records the call with input_hash alone (messages stripped), since the recorded form only needs the hash to re-check I0 on replay. |
 | tools | [ToolDefinition](#agentsessions-v1-ToolDefinition) | repeated | tools are the definitions offered to the model on this call. Wire-only like messages: the recorded form keeps input_hash, which covers them. |
 | tool_choice | [ToolChoice](#agentsessions-v1-ToolChoice) |  | tool_choice constrains whether and which tool the model calls. Wire-only like messages and covered by input_hash. Unset means the provider default. |
+| native | [bool](#bool) |  | provider invocation belongs to harness; host only records/replays |
 
 
 
@@ -323,6 +330,44 @@ message. Under STATELESS_REPLAY the harness never calls a provider directly.
 | ----- | ---- | ----- | ----------- |
 | key | [string](#string) |  |  |
 | value | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="agentsessions-v1-NativeModelCompletion"></a>
+
+### NativeModelCompletion
+Native provider completion over the already-owned harness stream. This is
+not an enforcement proof. The host issues a per-call grant only on live
+execution after MODEL_CALL is journaled; replay sends its recorded result.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| model_call_id | [string](#string) |  |  |
+| message | [Message](#agentsessions-v1-Message) |  |  |
+| usage | [Usage](#agentsessions-v1-Usage) |  |  |
+| error | [string](#string) |  |  |
+
+
+
+
+
+
+<a name="agentsessions-v1-NativeToolCompletion"></a>
+
+### NativeToolCompletion
+A live native tool completion, never a journal event or enforcement proof.
+The host grants only after recording TOOL_CALL; replay sends recorded results.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| tool_call_id | [string](#string) |  |  |
+| result | [ToolResult](#agentsessions-v1-ToolResult) |  |  |
+| error | [string](#string) |  |  |
 
 
 
@@ -460,6 +505,7 @@ ToolCall aligns with an MCP tool call (name &#43; structured args).
 | args | [google.protobuf.Struct](https://protobuf.dev/reference/protobuf/google.protobuf/#struct) |  |  |
 | mediation | [Mediation](#agentsessions-v1-Mediation) |  |  |
 | idempotency_key | [string](#string) |  | §3/I3: dedups a retried side-effecting call tool-side |
+| native | [bool](#bool) |  | tool invocation belongs to the harness; covered by request identity |
 
 
 
@@ -567,6 +613,8 @@ itself is a separate host-owned APPROVAL_RESULT; it is not embedded in this mess
 | EVENT_ERROR | 11 |  |
 | EVENT_EXECUTION_START | 12 | host-owned config/cursor/input count, before inputs and harness effects |
 | EVENT_PARKED | 13 | Harness acknowledgement of ControllerFrame.park with the exact ApprovalRef. Transport only: the host MUST NOT journal/hash-chain it or treat it as a terminal execution outcome. |
+| EVENT_NATIVE_MODEL_RESULT | 14 | correlated transport-only completion, never journaled |
+| EVENT_NATIVE_TOOL_RESULT | 15 | correlated transport-only completion, never journaled |
 
 
 
@@ -584,6 +632,7 @@ itself is a separate host-owned APPROVAL_RESULT; it is not embedded in this mess
 | LIFECYCLE_BASELINE | 4 |  |
 | LIFECYCLE_CANCEL | 5 |  |
 | LIFECYCLE_DELETE | 6 | Host-owned, session-scoped permanent deletion intent (empty Event.execution_id). It fences writes but does not terminate compute or confirm resource reclamation. |
+| LIFECYCLE_COMPUTE_OWNED | 7 | Host-owned exact cleanup authority before governed compute resumes. Never execution-start, active-enforcement proof or permission to dispatch. |
 
 
 
@@ -722,6 +771,8 @@ catching the error cannot authorize a later model/tool effect or mark recovery c
 | approval | [ApprovalResult](#agentsessions-v1-ApprovalResult) |  | host-owned committed decision, before the correlated tool receipt |
 | tool | [ToolResult](#agentsessions-v1-ToolResult) |  | result for a CONTROLLER_MEDIATED or decided REQUIRES_APPROVAL call |
 | model | [ModelResult](#agentsessions-v1-ModelResult) |  | served completion for a mediated/replayed model call |
+| native_model_call_id | [string](#string) |  | transport-only live invocation grant |
+| native_tool_call_id | [string](#string) |  | transport-only live tool invocation grant |
 | park | [ApprovalRef](#agentsessions-v1-ApprovalRef) |  | host-owned unresolved request; requires correlated EVENT_PARKED |
 
 
@@ -1477,6 +1528,7 @@ stable when a session is created mid-pagination; an offset would skip or repeat 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
+| execution_requirement | [bytes](#bytes) |  | Mandatory opaque whole-execution input; immutable for this session. |
 | metadata | [ResourceMetadata](#agentsessions-v1-ResourceMetadata) |  |  |
 | harness | [string](#string) |  |  |
 | model | [string](#string) |  | model-agnostic id |

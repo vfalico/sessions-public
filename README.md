@@ -114,3 +114,56 @@ release tag, so the contract cannot break silently
 and OpenTelemetry GenAI. See [what it composes with](docs/faq.md#what-does-it-compose-with).
 
 [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)
+
+
+## Experimental owned native model/tool placement
+
+`harnessnode` explicitly selects `HARNESS_KIND=toolchat` and
+`HARNESS_MODEL_PLACEMENT=native` for the bounded `toolchat` harness (version 1).
+Set `HARNESS_MODEL` and `HARNESS_MODEL_BASE_URL`; optional
+`HARNESS_MODEL_PATH` selects the **Responses** endpoint (default `/responses`),
+and `HARNESS_MODEL_API_KEY` supplies bearer credentials inside the sandbox.
+This is not the historical tool-free `chat` profile. It does not enable tools
+in Kaimahi's existing chat-only Suite verifier or qualify a new Kaimahi profile.
+The owned Sessions/Substrate integration can register a distinct `toolchat`
+route configured with its exact descriptor and operator-owned ActorTemplate.
+Do not attach host model/tool executors to a governed route.
+
+The harness offers one `http_get` tool, performs at most eight model/tool
+rounds, and retains no private conversation state. HTTP GET uses no ambient
+proxy, redirects, cookies, credentials, or retries; response size is limited
+to 1 MiB and each request has a 10-second timeout. URL admission is not an
+allowlist. The owning runtime and its whole-requirement enforcer alone decide
+network access; no endpoint exception is inferred by this harness.
+
+`harnesswire.NewNativeToolServer` configures native callbacks in the harness
+process. The host records `TOOL_CALL` before granting a correlated invocation
+on that same stream. `Native` is part of the durable request identity; the
+callback is transport-only. Replay returns recorded receipts without a grant;
+recovery may re-drive an exact terminal intent only after matching placement,
+ID, arguments, mediation, and idempotency key. Approval-gated native tools
+refuse before invocation. Native callback errors retain the intent and are
+not fabricated as successful receipts. An idempotency key is not an automatic
+exactly-once guarantee for external HTTP: external effects must remain safe
+to repeat under the tool's own semantics. GET has no application write intent.
+
+Configuring a native server does **not** establish compute isolation. A
+standalone harness process with this configuration is not a governed runtime.
+The owning runtime must prepare non-running compute, select one complete
+requirement enforcer, independently verify binding, then release execution.
+Governed turn failures attempt exact-incarnation stop under a fresh bounded
+cleanup context; failure leaves retirement visibly pending rather than
+claiming that closing a stream stopped compute. Governed checkpoint/restore,
+fork, and host callbacks remain unsupported fail-closed lanes.
+
+Reproduce focused exchange tests with:
+
+```sh
+go test -race ./harnesswire -run 'TestNativeTool|TestNativeModelToolHTTP|TestProductionToolchatHTTP'
+go test -race ./harness/toolchatagent ./cmd/harnessnode ./internal/modelconfig
+```
+
+These are real gRPC and HTTP exchanges in a test process, not integrated
+native enforcement acceptance. Source protobuf additions are generated with
+`protoc -I api --go_out=api/genpb --go_opt=paths=source_relative api/common.proto api/harness.proto`
+using the repository-pinned protobuf generator version.

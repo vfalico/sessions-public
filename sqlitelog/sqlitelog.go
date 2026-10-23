@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS sessions_project_created
 // build can identify a database without inspecting its columns. Version 1 is what v0.1.0 through
 // v0.1.2 shipped. Version 2 adds the harness registry; version 3 adds approval reporting;
 // version 4 adds permanent deletion intent; version 5 adds caller ownership and an authorization marker.
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 // migrations[i] moves a database from version i+1 to i+2, inside the migration transaction. The
 // array length is tied to SchemaVersion, so bumping one without the other does not compile.
@@ -93,6 +93,7 @@ var migrations = [SchemaVersion - 1]func(*sql.Tx) error{
 	migrateV2ToV3,
 	migrateV3ToV4,
 	migrateV4ToV5,
+ migrateV5ToV6,
 }
 
 // migrateV3ToV4 adds the deletion columns. deletion_completed_at is reserved for resource cleanup
@@ -622,4 +623,10 @@ func decode(blob []byte) (api.Event, error) {
 		return api.Event{}, err
 	}
 	return wire.EventFromProto(pb), nil
+}
+
+// The schema version bump also makes old writers refuse a governed database.
+func migrateV5ToV6(tx *sql.Tx) error {
+ _,err:=tx.Exec(`ALTER TABLE sessions ADD COLUMN execution_requirement BLOB NOT NULL DEFAULT X''`)
+ return err
 }

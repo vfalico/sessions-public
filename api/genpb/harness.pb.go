@@ -550,6 +550,8 @@ type ControllerFrame struct {
 	//	*ControllerFrame_Approval
 	//	*ControllerFrame_Tool
 	//	*ControllerFrame_Model
+	//	*ControllerFrame_NativeModelCallId
+	//	*ControllerFrame_NativeToolCallId
 	//	*ControllerFrame_Park
 	Frame         isControllerFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
@@ -652,6 +654,24 @@ func (x *ControllerFrame) GetModel() *ModelResult {
 	return nil
 }
 
+func (x *ControllerFrame) GetNativeModelCallId() string {
+	if x != nil {
+		if x, ok := x.Frame.(*ControllerFrame_NativeModelCallId); ok {
+			return x.NativeModelCallId
+		}
+	}
+	return ""
+}
+
+func (x *ControllerFrame) GetNativeToolCallId() string {
+	if x != nil {
+		if x, ok := x.Frame.(*ControllerFrame_NativeToolCallId); ok {
+			return x.NativeToolCallId
+		}
+	}
+	return ""
+}
+
 func (x *ControllerFrame) GetPark() *ApprovalRef {
 	if x != nil {
 		if x, ok := x.Frame.(*ControllerFrame_Park); ok {
@@ -685,6 +705,14 @@ type ControllerFrame_Model struct {
 	Model *ModelResult `protobuf:"bytes,7,opt,name=model,proto3,oneof"` // served completion for a mediated/replayed model call
 }
 
+type ControllerFrame_NativeModelCallId struct {
+	NativeModelCallId string `protobuf:"bytes,9,opt,name=native_model_call_id,json=nativeModelCallId,proto3,oneof"` // transport-only live invocation grant
+}
+
+type ControllerFrame_NativeToolCallId struct {
+	NativeToolCallId string `protobuf:"bytes,10,opt,name=native_tool_call_id,json=nativeToolCallId,proto3,oneof"` // transport-only live tool invocation grant
+}
+
 type ControllerFrame_Park struct {
 	Park *ApprovalRef `protobuf:"bytes,8,opt,name=park,proto3,oneof"` // host-owned unresolved request; requires correlated EVENT_PARKED
 }
@@ -698,6 +726,10 @@ func (*ControllerFrame_Approval) isControllerFrame_Frame() {}
 func (*ControllerFrame_Tool) isControllerFrame_Frame() {}
 
 func (*ControllerFrame_Model) isControllerFrame_Frame() {}
+
+func (*ControllerFrame_NativeModelCallId) isControllerFrame_Frame() {}
+
+func (*ControllerFrame_NativeToolCallId) isControllerFrame_Frame() {}
 
 func (*ControllerFrame_Park) isControllerFrame_Frame() {}
 
@@ -795,7 +827,7 @@ const file_harness_proto_rawDesc = "" +
 	"\bidentity\x18\x04 \x01(\v2!.agentsessions.v1.IdentityContextR\bidentity\x12&\n" +
 	"\x0fresume_from_seq\x18\x05 \x01(\x03R\rresumeFromSeq\" \n" +
 	"\x06Cancel\x12\x16\n" +
-	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x9c\x03\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x80\x04\n" +
 	"\x0fControllerFrame\x12\x18\n" +
 	"\asession\x18\x01 \x01(\tR\asession\x12!\n" +
 	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12/\n" +
@@ -803,7 +835,10 @@ const file_harness_proto_rawDesc = "" +
 	"\x06cancel\x18\x04 \x01(\v2\x18.agentsessions.v1.CancelH\x00R\x06cancel\x12>\n" +
 	"\bapproval\x18\x05 \x01(\v2 .agentsessions.v1.ApprovalResultH\x00R\bapproval\x122\n" +
 	"\x04tool\x18\x06 \x01(\v2\x1c.agentsessions.v1.ToolResultH\x00R\x04tool\x125\n" +
-	"\x05model\x18\a \x01(\v2\x1d.agentsessions.v1.ModelResultH\x00R\x05model\x123\n" +
+	"\x05model\x18\a \x01(\v2\x1d.agentsessions.v1.ModelResultH\x00R\x05model\x121\n" +
+	"\x14native_model_call_id\x18\t \x01(\tH\x00R\x11nativeModelCallId\x12/\n" +
+	"\x13native_tool_call_id\x18\n" +
+	" \x01(\tH\x00R\x10nativeToolCallId\x123\n" +
 	"\x04park\x18\b \x01(\v2\x1d.agentsessions.v1.ApprovalRefH\x00R\x04parkB\a\n" +
 	"\x05frame\"\x95\x01\n" +
 	"\vModelResult\x123\n" +
@@ -892,6 +927,8 @@ func file_harness_proto_init() {
 		(*ControllerFrame_Approval)(nil),
 		(*ControllerFrame_Tool)(nil),
 		(*ControllerFrame_Model)(nil),
+		(*ControllerFrame_NativeModelCallId)(nil),
+		(*ControllerFrame_NativeToolCallId)(nil),
 		(*ControllerFrame_Park)(nil),
 	}
 	type x struct{}

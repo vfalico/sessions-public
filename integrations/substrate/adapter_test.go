@@ -25,6 +25,8 @@ type fakeControl struct {
 	atepb.ControlClient
 	calls      []string
 	lastCreate *atepb.Actor
+    lastResume *atepb.ResumeActorRequest
+	lastDelete *atepb.DeleteActorRequest
 	lastTag    *atepb.Tag
 	actor      *atepb.Actor
 	getErr     error
@@ -52,6 +54,7 @@ func (f *fakeControl) CreateActor(_ context.Context, in *atepb.CreateActorReques
 	return stored, nil
 }
 func (f *fakeControl) ResumeActor(_ context.Context, in *atepb.ResumeActorRequest, _ ...grpc.CallOption) (*atepb.ResumeActorResponse, error) {
+    f.lastResume = proto.Clone(in).(*atepb.ResumeActorRequest)
 	f.calls = append(f.calls, "resume:"+in.GetActor().GetAtespace()+"/"+in.GetActor().GetName())
 	if f.resumeErr != nil {
 		return nil, f.resumeErr
@@ -66,6 +69,7 @@ func (f *fakeControl) SuspendActor(_ context.Context, in *atepb.SuspendActorRequ
 	return &atepb.SuspendActorResponse{Actor: f.actor}, nil
 }
 func (f *fakeControl) DeleteActor(_ context.Context, in *atepb.DeleteActorRequest, _ ...grpc.CallOption) (*atepb.Actor, error) {
+	f.lastDelete = proto.CloneOf(in)
 	f.calls = append(f.calls, "delete:"+in.GetActor().GetName())
 	return &atepb.Actor{}, nil
 }
@@ -560,5 +564,20 @@ func TestResumeNotFoundOnAnExistingActorIsNotLostState(t *testing.T) {
 				t.Fatalf("err=%v, want api.ErrMemoryStateLost", err)
 			}
 		})
+	}
+}
+
+func TestExactTerminationUsesNativeUIDPrecondition(t *testing.T) {
+	f := &fakeControl{}
+	ad := FromClient(f)
+	ref := substrate.ActorRef{Atespace: "space", Name: "owned"}
+	if err := ad.TerminateActor(t.Context(), ref, ""); err == nil || len(f.calls) != 0 {
+		t.Fatal("missing identity reached compute", err, f.calls)
+	}
+	if err := ad.TerminateActor(t.Context(), ref, "original-uid"); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastDelete == nil || !f.lastDelete.AnyState || f.lastDelete.GetOptions().GetUid() != "original-uid" || f.lastDelete.GetActor().GetName() != "owned" {
+		t.Fatal(f.lastDelete)
 	}
 }

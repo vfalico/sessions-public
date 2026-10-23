@@ -47,6 +47,26 @@ func New(cfg Config) (*openai.Client, error) {
 	return openai.New(opts...)
 }
 
+// NewResponses selects the stateless tool-capable Responses protocol explicitly.
+// It preserves the same keyed-HTTP admission rule as New; no protocol fallback.
+func NewResponses(cfg Config) (*openai.ResponsesClient, error) {
+	if err := checkKeyedHTTP(cfg); err != nil {
+		return nil, err
+	}
+	opts := []openai.Option{openai.WithModel(cfg.Model), openai.WithBaseURL(cfg.BaseURL)}
+	if cfg.Path != "" {
+		opts = append(opts, openai.WithPath(cfg.Path))
+	}
+	if cfg.APIKey != "" {
+		if strings.EqualFold(cfg.AuthHeader, "Authorization") {
+			opts = append(opts, openai.WithAPIKey(cfg.APIKey))
+		} else {
+			opts = append(opts, openai.WithHeader(cfg.AuthHeader, cfg.APIKey))
+		}
+	}
+	return openai.NewResponses(opts...)
+}
+
 // checkKeyedHTTP refuses an http BaseURL when an APIKey is set, unless the host (case-insensitive,
 // port ignored) is a loopback IP literal, localhost, or a name ending in .svc or .svc.cluster.local.
 // https, and http with no key, are left alone. Any key counts, whatever AuthHeader says, so a

@@ -45,7 +45,7 @@ func (s *liveSink) Model(ctx context.Context, req api.ModelRequest) (api.ModelRe
 func (s *liveSink) model(ctx context.Context, req api.ModelRequest) (api.ModelResponse, error) {
 	if _, err := s.append(api.Event{
 		Kind:      api.EventModelCall,
-		ModelCall: &api.ModelCall{Model: req.Model, InputHash: hashModelInput(req), ID: newID()},
+		ModelCall: &api.ModelCall{Native: req.Native, Model: req.Model, InputHash: hashModelInput(req), ID: newID()},
 	}); err != nil {
 		return api.ModelResponse{}, err
 	}
@@ -104,6 +104,12 @@ func (s *liveSink) ToolCall(ctx context.Context, tc api.ToolCall) (api.ToolResul
 
 func (s *liveSink) toolCall(ctx context.Context, tc api.ToolCall) (api.ToolResult, error) {
 	call := tc
+	if call.Native && (call.ID == "" || call.Mediation != api.MediationControllerMediated || call.InvokeNative == nil) {
+		return api.ToolResult{}, errors.New("native tool requires exact call identity and native exchange without approval")
+	}
+	if !call.Native && call.InvokeNative != nil {
+		return api.ToolResult{}, errors.New("native exchange without native tool request")
+	}
 	if call.Mediation == api.MediationRequiresApproval {
 		return s.parkTool(ctx, call)
 	}
@@ -144,12 +150,22 @@ func toolMediationError(mediation api.Mediation) error {
 // (execute, then append the result), so it is reused verbatim on crash-recovery, where the intent
 // is already durable in the journal.
 func (s *liveSink) execTool(ctx context.Context, call api.ToolCall) (api.ToolResult, error) {
-	if s.c.tool == nil {
-		// ToolCall is the controller-mediated path; without an executor it is a misconfiguration
-		// (in-harness-reported tools use Report instead).
-		return api.ToolResult{}, errors.New("controller: no tool executor configured")
+	var res api.ToolResult
+	var err error
+	if call.Native {
+		if call.InvokeNative == nil {
+			return api.ToolResult{}, errors.New("native tool exchange unavailable")
+		}
+		res, err = call.InvokeNative(ctx)
+	} else {
+		if call.InvokeNative != nil {
+			return api.ToolResult{}, errors.New("native exchange without native tool request")
+		}
+		if s.c.tool == nil {
+			return api.ToolResult{}, errors.New("controller: no tool executor configured")
+		}
+		res, err = s.c.tool(ctx, ToolCallContext{SessionUID: s.c.sessionUID}, call)
 	}
-	res, err := s.c.tool(ctx, ToolCallContext{SessionUID: s.c.sessionUID}, call)
 	if err != nil {
 		return api.ToolResult{}, err
 	}

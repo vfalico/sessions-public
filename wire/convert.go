@@ -340,14 +340,14 @@ func modelCallToProto(m *api.ModelCall) *v1.ModelCall {
 	if m == nil {
 		return nil
 	}
-	return &v1.ModelCall{Model: m.Model, Params: m.Params, InputHash: m.InputHash, Id: m.ID}
+	return &v1.ModelCall{Native: m.Native, Model: m.Model, Params: m.Params, InputHash: m.InputHash, Id: m.ID}
 }
 
 func modelCallFromProto(m *v1.ModelCall) *api.ModelCall {
 	if m == nil {
 		return nil
 	}
-	return &api.ModelCall{Model: m.GetModel(), Params: m.GetParams(), InputHash: m.GetInputHash(), ID: m.GetId()}
+	return &api.ModelCall{Native: m.GetNative(), Model: m.GetModel(), Params: m.GetParams(), InputHash: m.GetInputHash(), ID: m.GetId()}
 }
 
 func toolCallToProto(t *api.ToolCall) *v1.ToolCall {
@@ -360,6 +360,7 @@ func toolCallToProto(t *api.ToolCall) *v1.ToolCall {
 		Args:           toStruct(t.Args),
 		Mediation:      mediationToProto(t.Mediation),
 		IdempotencyKey: t.IdempotencyKey,
+		Native:         t.Native,
 	}
 }
 
@@ -373,6 +374,7 @@ func toolCallFromProto(t *v1.ToolCall) *api.ToolCall {
 		Args:           fromStruct(t.GetArgs()),
 		Mediation:      mediationFromProto(t.GetMediation()),
 		IdempotencyKey: t.GetIdempotencyKey(),
+		Native:         t.GetNative(),
 	}
 }
 
@@ -564,6 +566,8 @@ func lifecycleToProto(l *api.Lifecycle) *v1.Lifecycle {
 	}
 	out := &v1.Lifecycle{
 		Kind: lifecycleKindToProto(l.Kind), Detail: l.Detail, ComputeInstance: l.ComputeInstance,
+		ComputeId: l.ComputeID, ComputeRuntime: l.ComputeRuntime, ComputeHarness: l.ComputeHarness,
+		ComputeRequirement: append([]byte(nil), l.ComputeRequirement...), ComputeOperation: append([]byte(nil), l.ComputeOperation...),
 	}
 	if s := l.Snapshot; s != nil {
 		out.SnapshotLocal = s.Local
@@ -581,6 +585,8 @@ func lifecycleFromProto(l *v1.Lifecycle) *api.Lifecycle {
 	out := &api.Lifecycle{
 		Kind: lifecycleKindFromProto(l.GetKind()), Detail: l.GetDetail(),
 		ComputeInstance: l.GetComputeInstance(),
+		ComputeID:       l.GetComputeId(), ComputeRuntime: l.GetComputeRuntime(), ComputeHarness: l.GetComputeHarness(),
+		ComputeRequirement: append([]byte(nil), l.GetComputeRequirement()...), ComputeOperation: append([]byte(nil), l.GetComputeOperation()...),
 	}
 	if l.GetSnapshotLocal() != "" || l.GetSnapshotExternalUri() != "" || l.GetSnapshotMemory() || l.GetSnapshotSealed() {
 		out.Snapshot = &api.SnapshotRef{
@@ -741,6 +747,10 @@ func lifecycleKindToProto(k api.LifecycleKind) v1.Lifecycle_Kind {
 		return v1.Lifecycle_LIFECYCLE_BASELINE
 	case api.LifecycleCancel:
 		return v1.Lifecycle_LIFECYCLE_CANCEL
+	case api.LifecycleComputePrepared:
+		return v1.Lifecycle_LIFECYCLE_COMPUTE_PREPARED
+	case api.LifecycleComputeOwned:
+		return v1.Lifecycle_LIFECYCLE_COMPUTE_OWNED
 	case api.LifecycleDelete:
 		return v1.Lifecycle_LIFECYCLE_DELETE
 	default:
@@ -760,6 +770,10 @@ func lifecycleKindFromProto(k v1.Lifecycle_Kind) api.LifecycleKind {
 		return api.LifecycleBaseline
 	case v1.Lifecycle_LIFECYCLE_CANCEL:
 		return api.LifecycleCancel
+	case v1.Lifecycle_LIFECYCLE_COMPUTE_PREPARED:
+		return api.LifecycleComputePrepared
+	case v1.Lifecycle_LIFECYCLE_COMPUTE_OWNED:
+		return api.LifecycleComputeOwned
 	case v1.Lifecycle_LIFECYCLE_DELETE:
 		return api.LifecycleDelete
 	default:

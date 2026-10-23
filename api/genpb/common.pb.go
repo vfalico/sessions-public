@@ -107,7 +107,9 @@ const (
 	EventKind_EVENT_EXECUTION_START  EventKind = 12 // host-owned config/cursor/input count, before inputs and harness effects
 	// Harness acknowledgement of ControllerFrame.park with the exact ApprovalRef. Transport only:
 	// the host MUST NOT journal/hash-chain it or treat it as a terminal execution outcome.
-	EventKind_EVENT_PARKED EventKind = 13
+	EventKind_EVENT_PARKED              EventKind = 13
+	EventKind_EVENT_NATIVE_MODEL_RESULT EventKind = 14 // correlated transport-only completion, never journaled
+	EventKind_EVENT_NATIVE_TOOL_RESULT  EventKind = 15 // correlated transport-only completion, never journaled
 )
 
 // Enum value maps for EventKind.
@@ -127,22 +129,26 @@ var (
 		11: "EVENT_ERROR",
 		12: "EVENT_EXECUTION_START",
 		13: "EVENT_PARKED",
+		14: "EVENT_NATIVE_MODEL_RESULT",
+		15: "EVENT_NATIVE_TOOL_RESULT",
 	}
 	EventKind_value = map[string]int32{
-		"EVENT_KIND_UNSPECIFIED": 0,
-		"EVENT_INPUT":            1,
-		"EVENT_MODEL_CALL":       2,
-		"EVENT_OUTPUT":           3,
-		"EVENT_TOOL_CALL":        4,
-		"EVENT_TOOL_RESULT":      5,
-		"EVENT_APPROVAL_REQUEST": 6,
-		"EVENT_APPROVAL_RESULT":  7,
-		"EVENT_USAGE":            8,
-		"EVENT_LIFECYCLE":        9,
-		"EVENT_END":              10,
-		"EVENT_ERROR":            11,
-		"EVENT_EXECUTION_START":  12,
-		"EVENT_PARKED":           13,
+		"EVENT_KIND_UNSPECIFIED":    0,
+		"EVENT_INPUT":               1,
+		"EVENT_MODEL_CALL":          2,
+		"EVENT_OUTPUT":              3,
+		"EVENT_TOOL_CALL":           4,
+		"EVENT_TOOL_RESULT":         5,
+		"EVENT_APPROVAL_REQUEST":    6,
+		"EVENT_APPROVAL_RESULT":     7,
+		"EVENT_USAGE":               8,
+		"EVENT_LIFECYCLE":           9,
+		"EVENT_END":                 10,
+		"EVENT_ERROR":               11,
+		"EVENT_EXECUTION_START":     12,
+		"EVENT_PARKED":              13,
+		"EVENT_NATIVE_MODEL_RESULT": 14,
+		"EVENT_NATIVE_TOOL_RESULT":  15,
 	}
 )
 
@@ -291,6 +297,12 @@ const (
 	// Host-owned, session-scoped permanent deletion intent (empty Event.execution_id).
 	// It fences writes but does not terminate compute or confirm resource reclamation.
 	Lifecycle_LIFECYCLE_DELETE Lifecycle_Kind = 6
+	// Host-owned exact cleanup authority before governed compute resumes.
+	// Never execution-start, active-enforcement proof or permission to dispatch.
+	Lifecycle_LIFECYCLE_COMPUTE_OWNED Lifecycle_Kind = 7
+	// Host-authored opaque owner operation, durable before creating RPC.
+	// Never active enforcement or dispatch authority.
+	Lifecycle_LIFECYCLE_COMPUTE_PREPARED Lifecycle_Kind = 8
 )
 
 // Enum value maps for Lifecycle_Kind.
@@ -303,15 +315,19 @@ var (
 		4: "LIFECYCLE_BASELINE",
 		5: "LIFECYCLE_CANCEL",
 		6: "LIFECYCLE_DELETE",
+		7: "LIFECYCLE_COMPUTE_OWNED",
+		8: "LIFECYCLE_COMPUTE_PREPARED",
 	}
 	Lifecycle_Kind_value = map[string]int32{
-		"LIFECYCLE_UNSPECIFIED": 0,
-		"LIFECYCLE_SUSPEND":     1,
-		"LIFECYCLE_RESUME":      2,
-		"LIFECYCLE_FORK":        3,
-		"LIFECYCLE_BASELINE":    4,
-		"LIFECYCLE_CANCEL":      5,
-		"LIFECYCLE_DELETE":      6,
+		"LIFECYCLE_UNSPECIFIED":      0,
+		"LIFECYCLE_SUSPEND":          1,
+		"LIFECYCLE_RESUME":           2,
+		"LIFECYCLE_FORK":             3,
+		"LIFECYCLE_BASELINE":         4,
+		"LIFECYCLE_CANCEL":           5,
+		"LIFECYCLE_DELETE":           6,
+		"LIFECYCLE_COMPUTE_OWNED":    7,
+		"LIFECYCLE_COMPUTE_PREPARED": 8,
 	}
 )
 
@@ -1126,6 +1142,7 @@ type ModelCall struct {
 	// tool_choice constrains whether and which tool the model calls. Wire-only like messages and
 	// covered by input_hash. Unset means the provider default.
 	ToolChoice    *ToolChoice `protobuf:"bytes,7,opt,name=tool_choice,json=toolChoice,proto3" json:"tool_choice,omitempty"`
+	Native        bool        `protobuf:"varint,8,opt,name=native,proto3" json:"native,omitempty"` // provider invocation belongs to harness; host only records/replays
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1207,6 +1224,13 @@ func (x *ModelCall) GetToolChoice() *ToolChoice {
 		return x.ToolChoice
 	}
 	return nil
+}
+
+func (x *ModelCall) GetNative() bool {
+	if x != nil {
+		return x.Native
+	}
+	return false
 }
 
 // ToolDefinition is a tool offered to a model on one call. It aligns with an MCP Tool (name,
@@ -1402,6 +1426,7 @@ type ToolCall struct {
 	Args           *structpb.Struct       `protobuf:"bytes,3,opt,name=args,proto3" json:"args,omitempty"`
 	Mediation      Mediation              `protobuf:"varint,4,opt,name=mediation,proto3,enum=agentsessions.v1.Mediation" json:"mediation,omitempty"`
 	IdempotencyKey string                 `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"` // §3/I3: dedups a retried side-effecting call tool-side
+	Native         bool                   `protobuf:"varint,6,opt,name=native,proto3" json:"native,omitempty"`                                      // tool invocation belongs to the harness; covered by request identity
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1469,6 +1494,13 @@ func (x *ToolCall) GetIdempotencyKey() string {
 		return x.IdempotencyKey
 	}
 	return ""
+}
+
+func (x *ToolCall) GetNative() bool {
+	if x != nil {
+		return x.Native
+	}
+	return false
 }
 
 // ToolResult is a durable execution receipt, also usable as model-facing history. A decision
@@ -1910,15 +1942,26 @@ type Lifecycle struct {
 	SnapshotExternalUri string `protobuf:"bytes,4,opt,name=snapshot_external_uri,json=snapshotExternalUri,proto3" json:"snapshot_external_uri,omitempty"`
 	SnapshotMemory      bool   `protobuf:"varint,5,opt,name=snapshot_memory,json=snapshotMemory,proto3" json:"snapshot_memory,omitempty"`
 	SnapshotSealed      bool   `protobuf:"varint,6,opt,name=snapshot_sealed,json=snapshotSealed,proto3" json:"snapshot_sealed,omitempty"`
-	// Set only on FORK: the identity of the compute instance the child was cloned onto, in the
+	// Set on COMPUTE_OWNED for exact suspended cleanup authority, or on FORK for
+	// the identity of the compute instance the child was cloned onto, in the
 	// same form as ExecutionStart.compute_instance (substrate: the cloned actor's UID). The child's
 	// turns are compared with it until the child records one of its own, so a turn, Resume,
 	// Suspend or Fork placed on another instance before the child's first turn is refused. Empty
 	// means not recorded (a stateless fork, or a marker written before this field existed), and
 	// the child's first turn is not compared.
 	ComputeInstance string `protobuf:"bytes,7,opt,name=compute_instance,json=computeInstance,proto3" json:"compute_instance,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// COMPUTE_OWNED only: original incarnation handle, never a workload identity.
+	ComputeId string `protobuf:"bytes,8,opt,name=compute_id,json=computeId,proto3" json:"compute_id,omitempty"`
+	// COMPUTE_OWNED only: owning runtime label; opaque to the session controller.
+	ComputeRuntime string `protobuf:"bytes,9,opt,name=compute_runtime,json=computeRuntime,proto3" json:"compute_runtime,omitempty"`
+	// COMPUTE_OWNED only: resolved host registry name, not harness self-assertion.
+	ComputeHarness string `protobuf:"bytes,10,opt,name=compute_harness,json=computeHarness,proto3" json:"compute_harness,omitempty"`
+	// COMPUTE_OWNED only: frozen original requirement. No active-policy authority.
+	ComputeRequirement []byte `protobuf:"bytes,11,opt,name=compute_requirement,json=computeRequirement,proto3" json:"compute_requirement,omitempty"`
+	// COMPUTE_PREPARED only: original opaque owning-backend operation descriptor.
+	ComputeOperation []byte `protobuf:"bytes,12,opt,name=compute_operation,json=computeOperation,proto3" json:"compute_operation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Lifecycle) Reset() {
@@ -1998,6 +2041,41 @@ func (x *Lifecycle) GetComputeInstance() string {
 		return x.ComputeInstance
 	}
 	return ""
+}
+
+func (x *Lifecycle) GetComputeId() string {
+	if x != nil {
+		return x.ComputeId
+	}
+	return ""
+}
+
+func (x *Lifecycle) GetComputeRuntime() string {
+	if x != nil {
+		return x.ComputeRuntime
+	}
+	return ""
+}
+
+func (x *Lifecycle) GetComputeHarness() string {
+	if x != nil {
+		return x.ComputeHarness
+	}
+	return ""
+}
+
+func (x *Lifecycle) GetComputeRequirement() []byte {
+	if x != nil {
+		return x.ComputeRequirement
+	}
+	return nil
+}
+
+func (x *Lifecycle) GetComputeOperation() []byte {
+	if x != nil {
+		return x.ComputeOperation
+	}
+	return nil
 }
 
 // ExecutionStart is host-owned invocation state, committed before inputs and harness execution.
@@ -2132,6 +2210,8 @@ type Event struct {
 	//	*Event_Error
 	//	*Event_ExecutionStart
 	//	*Event_Parked
+	//	*Event_NativeModel
+	//	*Event_NativeTool
 	Body          isEvent_Body `protobuf_oneof:"body"`
 	Actor         *IdentityRef `protobuf:"bytes,18,opt,name=actor,proto3" json:"actor,omitempty"` // emitter principal -> provenance
 	unknownFields protoimpl.UnknownFields
@@ -2311,6 +2391,24 @@ func (x *Event) GetParked() *ApprovalRef {
 	return nil
 }
 
+func (x *Event) GetNativeModel() *NativeModelCompletion {
+	if x != nil {
+		if x, ok := x.Body.(*Event_NativeModel); ok {
+			return x.NativeModel
+		}
+	}
+	return nil
+}
+
+func (x *Event) GetNativeTool() *NativeToolCompletion {
+	if x != nil {
+		if x, ok := x.Body.(*Event_NativeTool); ok {
+			return x.NativeTool
+		}
+	}
+	return nil
+}
+
 func (x *Event) GetActor() *IdentityRef {
 	if x != nil {
 		return x.Actor
@@ -2371,6 +2469,14 @@ type Event_Parked struct {
 	Parked *ApprovalRef `protobuf:"bytes,20,opt,name=parked,proto3,oneof"`
 }
 
+type Event_NativeModel struct {
+	NativeModel *NativeModelCompletion `protobuf:"bytes,21,opt,name=native_model,json=nativeModel,proto3,oneof"`
+}
+
+type Event_NativeTool struct {
+	NativeTool *NativeToolCompletion `protobuf:"bytes,22,opt,name=native_tool,json=nativeTool,proto3,oneof"`
+}
+
 func (*Event_Message) isEvent_Body() {}
 
 func (*Event_Model) isEvent_Body() {}
@@ -2394,6 +2500,10 @@ func (*Event_Error) isEvent_Body() {}
 func (*Event_ExecutionStart) isEvent_Body() {}
 
 func (*Event_Parked) isEvent_Body() {}
+
+func (*Event_NativeModel) isEvent_Body() {}
+
+func (*Event_NativeTool) isEvent_Body() {}
 
 // LogRecord is the host's durable, ordered wrapper around an Event. The host assigns seq,
 // links the hash-chain (content_hash = H(prev_hash || seq || canonical(event)); at a fork
@@ -2476,6 +2586,139 @@ func (x *LogRecord) GetEvent() *Event {
 	return nil
 }
 
+// Native provider completion over the already-owned harness stream. This is
+// not an enforcement proof. The host issues a per-call grant only on live
+// execution after MODEL_CALL is journaled; replay sends its recorded result.
+type NativeModelCompletion struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ModelCallId   string                 `protobuf:"bytes,1,opt,name=model_call_id,json=modelCallId,proto3" json:"model_call_id,omitempty"`
+	Message       *Message               `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Usage         *Usage                 `protobuf:"bytes,3,opt,name=usage,proto3" json:"usage,omitempty"`
+	Error         string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NativeModelCompletion) Reset() {
+	*x = NativeModelCompletion{}
+	mi := &file_common_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NativeModelCompletion) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NativeModelCompletion) ProtoMessage() {}
+
+func (x *NativeModelCompletion) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NativeModelCompletion.ProtoReflect.Descriptor instead.
+func (*NativeModelCompletion) Descriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *NativeModelCompletion) GetModelCallId() string {
+	if x != nil {
+		return x.ModelCallId
+	}
+	return ""
+}
+
+func (x *NativeModelCompletion) GetMessage() *Message {
+	if x != nil {
+		return x.Message
+	}
+	return nil
+}
+
+func (x *NativeModelCompletion) GetUsage() *Usage {
+	if x != nil {
+		return x.Usage
+	}
+	return nil
+}
+
+func (x *NativeModelCompletion) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// A live native tool completion, never a journal event or enforcement proof.
+// The host grants only after recording TOOL_CALL; replay sends recorded results.
+type NativeToolCompletion struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ToolCallId    string                 `protobuf:"bytes,1,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"`
+	Result        *ToolResult            `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
+	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NativeToolCompletion) Reset() {
+	*x = NativeToolCompletion{}
+	mi := &file_common_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NativeToolCompletion) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NativeToolCompletion) ProtoMessage() {}
+
+func (x *NativeToolCompletion) ProtoReflect() protoreflect.Message {
+	mi := &file_common_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NativeToolCompletion.ProtoReflect.Descriptor instead.
+func (*NativeToolCompletion) Descriptor() ([]byte, []int) {
+	return file_common_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *NativeToolCompletion) GetToolCallId() string {
+	if x != nil {
+		return x.ToolCallId
+	}
+	return ""
+}
+
+func (x *NativeToolCompletion) GetResult() *ToolResult {
+	if x != nil {
+		return x.Result
+	}
+	return nil
+}
+
+func (x *NativeToolCompletion) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_common_proto protoreflect.FileDescriptor
 
 const file_common_proto_rawDesc = "" +
@@ -2538,7 +2781,7 @@ const file_common_proto_rawDesc = "" +
 	"attributes\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfa\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x92\x03\n" +
 	"\tModelCall\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12?\n" +
 	"\x06params\x18\x02 \x03(\v2'.agentsessions.v1.ModelCall.ParamsEntryR\x06params\x12\x1d\n" +
@@ -2548,7 +2791,8 @@ const file_common_proto_rawDesc = "" +
 	"\bmessages\x18\x05 \x03(\v2\x19.agentsessions.v1.MessageR\bmessages\x126\n" +
 	"\x05tools\x18\x06 \x03(\v2 .agentsessions.v1.ToolDefinitionR\x05tools\x12=\n" +
 	"\vtool_choice\x18\a \x01(\v2\x1c.agentsessions.v1.ToolChoiceR\n" +
-	"toolChoice\x1a9\n" +
+	"toolChoice\x12\x16\n" +
+	"\x06native\x18\b \x01(\bR\x06native\x1a9\n" +
 	"\vParamsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x82\x01\n" +
@@ -2569,13 +2813,14 @@ const file_common_proto_rawDesc = "" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12!\n" +
 	"\finput_tokens\x18\x02 \x01(\x03R\vinputTokens\x12#\n" +
 	"\routput_tokens\x18\x03 \x01(\x03R\foutputTokens\x12)\n" +
-	"\x10reasoning_tokens\x18\x04 \x01(\x03R\x0freasoningTokens\"\xbf\x01\n" +
+	"\x10reasoning_tokens\x18\x04 \x01(\x03R\x0freasoningTokens\"\xd7\x01\n" +
 	"\bToolCall\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04tool\x18\x02 \x01(\tR\x04tool\x12+\n" +
 	"\x04args\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x04args\x129\n" +
 	"\tmediation\x18\x04 \x01(\x0e2\x1b.agentsessions.v1.MediationR\tmediation\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xd8\x03\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\x12\x16\n" +
+	"\x06native\x18\x06 \x01(\bR\x06native\"\xd8\x03\n" +
 	"\n" +
 	"ToolResult\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12/\n" +
@@ -2617,7 +2862,7 @@ const file_common_proto_rawDesc = "" +
 	"\n" +
 	"HarnessEnd\x12\x14\n" +
 	"\x05state\x18\x01 \x01(\tR\x05state\x12-\n" +
-	"\x05error\x18\x02 \x01(\v2\x17.agentsessions.v1.ErrorR\x05error\"\xda\x03\n" +
+	"\x05error\x18\x02 \x01(\v2\x17.agentsessions.v1.ErrorR\x05error\"\xe6\x05\n" +
 	"\tLifecycle\x124\n" +
 	"\x04kind\x18\x01 \x01(\x0e2 .agentsessions.v1.Lifecycle.KindR\x04kind\x12\x16\n" +
 	"\x06detail\x18\x02 \x01(\tR\x06detail\x12%\n" +
@@ -2625,7 +2870,14 @@ const file_common_proto_rawDesc = "" +
 	"\x15snapshot_external_uri\x18\x04 \x01(\tR\x13snapshotExternalUri\x12'\n" +
 	"\x0fsnapshot_memory\x18\x05 \x01(\bR\x0esnapshotMemory\x12'\n" +
 	"\x0fsnapshot_sealed\x18\x06 \x01(\bR\x0esnapshotSealed\x12)\n" +
-	"\x10compute_instance\x18\a \x01(\tR\x0fcomputeInstance\"\xa6\x01\n" +
+	"\x10compute_instance\x18\a \x01(\tR\x0fcomputeInstance\x12\x1d\n" +
+	"\n" +
+	"compute_id\x18\b \x01(\tR\tcomputeId\x12'\n" +
+	"\x0fcompute_runtime\x18\t \x01(\tR\x0ecomputeRuntime\x12'\n" +
+	"\x0fcompute_harness\x18\n" +
+	" \x01(\tR\x0ecomputeHarness\x12/\n" +
+	"\x13compute_requirement\x18\v \x01(\fR\x12computeRequirement\x12+\n" +
+	"\x11compute_operation\x18\f \x01(\fR\x10computeOperation\"\xe3\x01\n" +
 	"\x04Kind\x12\x19\n" +
 	"\x15LIFECYCLE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11LIFECYCLE_SUSPEND\x10\x01\x12\x14\n" +
@@ -2633,7 +2885,9 @@ const file_common_proto_rawDesc = "" +
 	"\x0eLIFECYCLE_FORK\x10\x03\x12\x16\n" +
 	"\x12LIFECYCLE_BASELINE\x10\x04\x12\x14\n" +
 	"\x10LIFECYCLE_CANCEL\x10\x05\x12\x14\n" +
-	"\x10LIFECYCLE_DELETE\x10\x06\"\xf4\x01\n" +
+	"\x10LIFECYCLE_DELETE\x10\x06\x12\x1b\n" +
+	"\x17LIFECYCLE_COMPUTE_OWNED\x10\a\x12\x1e\n" +
+	"\x1aLIFECYCLE_COMPUTE_PREPARED\x10\b\"\xf4\x01\n" +
 	"\x0eExecutionStart\x12\x16\n" +
 	"\x06config\x18\x01 \x01(\fR\x06config\x12&\n" +
 	"\x0fresume_from_seq\x18\x02 \x01(\x03R\rresumeFromSeq\x12$\n" +
@@ -2642,7 +2896,7 @@ const file_common_proto_rawDesc = "" +
 	"\aharness\x18\x04 \x01(\tR\aharness\x12'\n" +
 	"\x0fharness_version\x18\x05 \x01(\tR\x0eharnessVersion\x12)\n" +
 	"\x10compute_instance\x18\x06 \x01(\tR\x0fcomputeInstanceB\x0e\n" +
-	"\f_input_count\"\xb8\a\n" +
+	"\f_input_count\"\xd1\b\n" +
 	"\x05Event\x12!\n" +
 	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12*\n" +
 	"\x02ts\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x02ts\x12%\n" +
@@ -2660,7 +2914,10 @@ const file_common_proto_rawDesc = "" +
 	"\x03end\x18\x10 \x01(\v2\x1c.agentsessions.v1.HarnessEndH\x00R\x03end\x12/\n" +
 	"\x05error\x18\x11 \x01(\v2\x17.agentsessions.v1.ErrorH\x00R\x05error\x12K\n" +
 	"\x0fexecution_start\x18\x13 \x01(\v2 .agentsessions.v1.ExecutionStartH\x00R\x0eexecutionStart\x127\n" +
-	"\x06parked\x18\x14 \x01(\v2\x1d.agentsessions.v1.ApprovalRefH\x00R\x06parked\x123\n" +
+	"\x06parked\x18\x14 \x01(\v2\x1d.agentsessions.v1.ApprovalRefH\x00R\x06parked\x12L\n" +
+	"\fnative_model\x18\x15 \x01(\v2'.agentsessions.v1.NativeModelCompletionH\x00R\vnativeModel\x12I\n" +
+	"\vnative_tool\x18\x16 \x01(\v2&.agentsessions.v1.NativeToolCompletionH\x00R\n" +
+	"nativeTool\x123\n" +
 	"\x05actor\x18\x12 \x01(\v2\x1d.agentsessions.v1.IdentityRefR\x05actorB\x06\n" +
 	"\x04bodyJ\x04\b\x01\x10\x02J\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\xa2\x01\n" +
 	"\tLogRecord\x12\x10\n" +
@@ -2668,12 +2925,22 @@ const file_common_proto_rawDesc = "" +
 	"\tprev_hash\x18\x02 \x01(\tR\bprevHash\x12!\n" +
 	"\fcontent_hash\x18\x03 \x01(\tR\vcontentHash\x12\x14\n" +
 	"\x05fence\x18\x04 \x01(\x03R\x05fence\x12-\n" +
-	"\x05event\x18\x05 \x01(\v2\x17.agentsessions.v1.EventR\x05event*\x8d\x01\n" +
+	"\x05event\x18\x05 \x01(\v2\x17.agentsessions.v1.EventR\x05event\"\xb5\x01\n" +
+	"\x15NativeModelCompletion\x12\"\n" +
+	"\rmodel_call_id\x18\x01 \x01(\tR\vmodelCallId\x123\n" +
+	"\amessage\x18\x02 \x01(\v2\x19.agentsessions.v1.MessageR\amessage\x12-\n" +
+	"\x05usage\x18\x03 \x01(\v2\x17.agentsessions.v1.UsageR\x05usage\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"\x84\x01\n" +
+	"\x14NativeToolCompletion\x12 \n" +
+	"\ftool_call_id\x18\x01 \x01(\tR\n" +
+	"toolCallId\x124\n" +
+	"\x06result\x18\x02 \x01(\v2\x1c.agentsessions.v1.ToolResultR\x06result\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error*\x8d\x01\n" +
 	"\tMediation\x12\x19\n" +
 	"\x15MEDIATION_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dMEDIATION_IN_HARNESS_REPORTED\x10\x01\x12!\n" +
 	"\x1dMEDIATION_CONTROLLER_MEDIATED\x10\x02\x12\x1f\n" +
-	"\x1bMEDIATION_REQUIRES_APPROVAL\x10\x03*\xb6\x02\n" +
+	"\x1bMEDIATION_REQUIRES_APPROVAL\x10\x03*\xf3\x02\n" +
 	"\tEventKind\x12\x1a\n" +
 	"\x16EVENT_KIND_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vEVENT_INPUT\x10\x01\x12\x14\n" +
@@ -2689,7 +2956,9 @@ const file_common_proto_rawDesc = "" +
 	"\x12\x0f\n" +
 	"\vEVENT_ERROR\x10\v\x12\x19\n" +
 	"\x15EVENT_EXECUTION_START\x10\f\x12\x10\n" +
-	"\fEVENT_PARKED\x10\rB@Z>github.com/agent-primitives/sessions/api/genpb;agentsessionsv1b\x06proto3"
+	"\fEVENT_PARKED\x10\r\x12\x1d\n" +
+	"\x19EVENT_NATIVE_MODEL_RESULT\x10\x0e\x12\x1c\n" +
+	"\x18EVENT_NATIVE_TOOL_RESULT\x10\x0fB@Z>github.com/agent-primitives/sessions/api/genpb;agentsessionsv1b\x06proto3"
 
 var (
 	file_common_proto_rawDescOnce sync.Once
@@ -2704,7 +2973,7 @@ func file_common_proto_rawDescGZIP() []byte {
 }
 
 var file_common_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_common_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_common_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_common_proto_goTypes = []any{
 	(Mediation)(0),                // 0: agentsessions.v1.Mediation
 	(EventKind)(0),                // 1: agentsessions.v1.EventKind
@@ -2735,38 +3004,40 @@ var file_common_proto_goTypes = []any{
 	(*ExecutionStart)(nil),        // 26: agentsessions.v1.ExecutionStart
 	(*Event)(nil),                 // 27: agentsessions.v1.Event
 	(*LogRecord)(nil),             // 28: agentsessions.v1.LogRecord
-	nil,                           // 29: agentsessions.v1.Origin.AttributesEntry
-	nil,                           // 30: agentsessions.v1.ModelCall.ParamsEntry
-	(*timestamppb.Timestamp)(nil), // 31: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),       // 32: google.protobuf.Struct
+	(*NativeModelCompletion)(nil), // 29: agentsessions.v1.NativeModelCompletion
+	(*NativeToolCompletion)(nil),  // 30: agentsessions.v1.NativeToolCompletion
+	nil,                           // 31: agentsessions.v1.Origin.AttributesEntry
+	nil,                           // 32: agentsessions.v1.ModelCall.ParamsEntry
+	(*timestamppb.Timestamp)(nil), // 33: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),       // 34: google.protobuf.Struct
 }
 var file_common_proto_depIdxs = []int32{
-	31, // 0: agentsessions.v1.ResourceMetadata.create_time:type_name -> google.protobuf.Timestamp
-	31, // 1: agentsessions.v1.ResourceMetadata.update_time:type_name -> google.protobuf.Timestamp
+	33, // 0: agentsessions.v1.ResourceMetadata.create_time:type_name -> google.protobuf.Timestamp
+	33, // 1: agentsessions.v1.ResourceMetadata.update_time:type_name -> google.protobuf.Timestamp
 	7,  // 2: agentsessions.v1.Part.text:type_name -> agentsessions.v1.TextPart
 	8,  // 3: agentsessions.v1.Part.file:type_name -> agentsessions.v1.FilePart
 	9,  // 4: agentsessions.v1.Part.data:type_name -> agentsessions.v1.DataPart
 	10, // 5: agentsessions.v1.Part.reasoning:type_name -> agentsessions.v1.ReasoningPart
 	18, // 6: agentsessions.v1.Part.tool_call:type_name -> agentsessions.v1.ToolCall
 	19, // 7: agentsessions.v1.Part.tool_result:type_name -> agentsessions.v1.ToolResult
-	32, // 8: agentsessions.v1.DataPart.data:type_name -> google.protobuf.Struct
+	34, // 8: agentsessions.v1.DataPart.data:type_name -> google.protobuf.Struct
 	6,  // 9: agentsessions.v1.ReasoningPart.summary:type_name -> agentsessions.v1.Part
 	6,  // 10: agentsessions.v1.Message.parts:type_name -> agentsessions.v1.Part
-	29, // 11: agentsessions.v1.Origin.attributes:type_name -> agentsessions.v1.Origin.AttributesEntry
-	30, // 12: agentsessions.v1.ModelCall.params:type_name -> agentsessions.v1.ModelCall.ParamsEntry
+	31, // 11: agentsessions.v1.Origin.attributes:type_name -> agentsessions.v1.Origin.AttributesEntry
+	32, // 12: agentsessions.v1.ModelCall.params:type_name -> agentsessions.v1.ModelCall.ParamsEntry
 	11, // 13: agentsessions.v1.ModelCall.messages:type_name -> agentsessions.v1.Message
 	15, // 14: agentsessions.v1.ModelCall.tools:type_name -> agentsessions.v1.ToolDefinition
 	16, // 15: agentsessions.v1.ModelCall.tool_choice:type_name -> agentsessions.v1.ToolChoice
-	32, // 16: agentsessions.v1.ToolDefinition.input_schema:type_name -> google.protobuf.Struct
+	34, // 16: agentsessions.v1.ToolDefinition.input_schema:type_name -> google.protobuf.Struct
 	2,  // 17: agentsessions.v1.ToolChoice.mode:type_name -> agentsessions.v1.ToolChoice.Mode
-	32, // 18: agentsessions.v1.ToolCall.args:type_name -> google.protobuf.Struct
+	34, // 18: agentsessions.v1.ToolCall.args:type_name -> google.protobuf.Struct
 	0,  // 19: agentsessions.v1.ToolCall.mediation:type_name -> agentsessions.v1.Mediation
-	32, // 20: agentsessions.v1.ToolResult.output:type_name -> google.protobuf.Struct
+	34, // 20: agentsessions.v1.ToolResult.output:type_name -> google.protobuf.Struct
 	6,  // 21: agentsessions.v1.ToolResult.content:type_name -> agentsessions.v1.Part
 	3,  // 22: agentsessions.v1.ToolResult.code:type_name -> agentsessions.v1.ToolResult.Code
 	23, // 23: agentsessions.v1.HarnessEnd.error:type_name -> agentsessions.v1.Error
 	4,  // 24: agentsessions.v1.Lifecycle.kind:type_name -> agentsessions.v1.Lifecycle.Kind
-	31, // 25: agentsessions.v1.Event.ts:type_name -> google.protobuf.Timestamp
+	33, // 25: agentsessions.v1.Event.ts:type_name -> google.protobuf.Timestamp
 	1,  // 26: agentsessions.v1.Event.kind:type_name -> agentsessions.v1.EventKind
 	11, // 27: agentsessions.v1.Event.message:type_name -> agentsessions.v1.Message
 	14, // 28: agentsessions.v1.Event.model:type_name -> agentsessions.v1.ModelCall
@@ -2780,13 +3051,18 @@ var file_common_proto_depIdxs = []int32{
 	23, // 36: agentsessions.v1.Event.error:type_name -> agentsessions.v1.Error
 	26, // 37: agentsessions.v1.Event.execution_start:type_name -> agentsessions.v1.ExecutionStart
 	22, // 38: agentsessions.v1.Event.parked:type_name -> agentsessions.v1.ApprovalRef
-	12, // 39: agentsessions.v1.Event.actor:type_name -> agentsessions.v1.IdentityRef
-	27, // 40: agentsessions.v1.LogRecord.event:type_name -> agentsessions.v1.Event
-	41, // [41:41] is the sub-list for method output_type
-	41, // [41:41] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	29, // 39: agentsessions.v1.Event.native_model:type_name -> agentsessions.v1.NativeModelCompletion
+	30, // 40: agentsessions.v1.Event.native_tool:type_name -> agentsessions.v1.NativeToolCompletion
+	12, // 41: agentsessions.v1.Event.actor:type_name -> agentsessions.v1.IdentityRef
+	27, // 42: agentsessions.v1.LogRecord.event:type_name -> agentsessions.v1.Event
+	11, // 43: agentsessions.v1.NativeModelCompletion.message:type_name -> agentsessions.v1.Message
+	17, // 44: agentsessions.v1.NativeModelCompletion.usage:type_name -> agentsessions.v1.Usage
+	19, // 45: agentsessions.v1.NativeToolCompletion.result:type_name -> agentsessions.v1.ToolResult
+	46, // [46:46] is the sub-list for method output_type
+	46, // [46:46] is the sub-list for method input_type
+	46, // [46:46] is the sub-list for extension type_name
+	46, // [46:46] is the sub-list for extension extendee
+	0,  // [0:46] is the sub-list for field type_name
 }
 
 func init() { file_common_proto_init() }
@@ -2824,6 +3100,8 @@ func file_common_proto_init() {
 		(*Event_Error)(nil),
 		(*Event_ExecutionStart)(nil),
 		(*Event_Parked)(nil),
+		(*Event_NativeModel)(nil),
+		(*Event_NativeTool)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2831,7 +3109,7 @@ func file_common_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_common_proto_rawDesc), len(file_common_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   26,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

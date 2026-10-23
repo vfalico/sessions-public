@@ -201,10 +201,11 @@ func (ad *Adapter) DeleteTag(ctx context.Context, tag substrate.SnapshotID) erro
 func actorInfo(a *atepb.Actor) substrate.ActorInfo {
 	st := a.GetStatus()
 	return substrate.ActorInfo{
-		Status:   actorStatus(st.GetState()),
-		Worker:   st.GetWorkerAssignment().GetWorkerPod(),
-		Snapshot: heldSnapshot(st),
-		UID:      a.GetMetadata().GetUid(),
+		Status:               actorStatus(st.GetState()),
+		ExecutionRequirement: string(a.GetExecutionRequirement()),
+		Worker:               st.GetWorkerAssignment().GetWorkerPod(),
+		Snapshot:             heldSnapshot(st),
+		UID:                  a.GetMetadata().GetUid(),
 	}
 }
 
@@ -257,4 +258,86 @@ func actorStatus(s atepb.ActorState) substrate.ActorStatus {
 	default:
 		return substrate.StatusUnknown
 	}
+}
+
+// CreateActorWithRequirement carries complete frozen input on the native owning Actor.
+func (ad *Adapter) CreateActorWithRequirement(ctx context.Context, actor substrate.ActorRef, template substrate.ObjectRef, raw []byte) error {
+	_, err := ad.ctl.CreateActor(ctx, &atepb.CreateActorRequest{Actor: &atepb.Actor{Metadata: &atepb.ResourceMetadata{Atespace: actor.Atespace, Name: actor.Name}, ActorTemplate: templateRef(template), ExecutionRequirement: append([]byte(nil), raw...)}})
+	if status.Code(err) == codes.AlreadyExists {
+		return fmt.Errorf("%w: %s/%s: %w", substrate.ErrActorExists, actor.Atespace, actor.Name, err)
+	}
+	return err
+}
+
+// TerminateActor uses the native destructive-delete workflow. UID preconditions
+// are checked under the Actor lease before any worker or volume side effect;
+// AnyState avoids the governed snapshot/suspend funnel entirely.
+func (ad *Adapter) TerminateActor(ctx context.Context, actor substrate.ActorRef, uid string) error {
+	if uid == "" {
+		return fmt.Errorf("exact Actor UID is required for termination")
+	}
+	_, err := ad.ctl.DeleteActor(ctx, &atepb.DeleteActorRequest{Actor: objectRef(actor), AnyState: true, Options: &atepb.DeleteOptions{Uid: uid}})
+	// Owner finalizes deletion only after all native cleanup; a missing original
+	// record is an idempotent completed delete, not permission to delete replacement.
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	return busy(actor, err)
+}
+
+// VerifyActorExecution uses the native read-only path through the owning worker.
+func (ad *Adapter) VerifyActorExecution(ctx context.Context, actor substrate.ActorRef, uid string, raw []byte) error {
+	if uid == "" || len(raw) == 0 {
+		return fmt.Errorf("exact Actor and requirement required")
+	}
+	response, err := ad.ctl.VerifyActorExecution(ctx, &atepb.VerifyActorExecutionRequest{Actor: objectRef(actor), ActorUid: uid, ExecutionRequirement: append([]byte(nil), raw...)})
+	if err != nil {
+		return busy(actor, err)
+	}
+	if !response.GetActive() {
+		return fmt.Errorf("owning compute did not prove current enforcement")
+	}
+	return nil
+}
+
+// CreateActorWithRequirementIdentity returns only server-authored suspended
+// identity. It does not rediscover an object after an uncertain Create reply.
+func (ad *Adapter) CreateActorWithRequirementIdentity(ctx context.Context, actor substrate.ActorRef, template substrate.ObjectRef, raw []byte) (substrate.ActorInfo, error) {
+	a, err := ad.ctl.CreateActor(ctx, &atepb.CreateActorRequest{Actor: &atepb.Actor{Metadata: &atepb.ResourceMetadata{Atespace: actor.Atespace, Name: actor.Name}, ActorTemplate: templateRef(template), ExecutionRequirement: append([]byte(nil), raw...)}})
+	if status.Code(err) == codes.AlreadyExists {
+		return substrate.ActorInfo{}, fmt.Errorf("%w: %s/%s", substrate.ErrActorExists, actor.Atespace, actor.Name)
+	}
+	if err != nil {
+		return substrate.ActorInfo{}, err
+	}
+	return actorInfo(a), nil
+}
+
+// ResumeActorExact delegates the immutable UID precondition to the owner. The
+// accompanying compute patch validates it under the existing Actor lease.
+func (ad *Adapter) ResumeActorExact(ctx context.Context, actor substrate.ActorRef, uid string) (substrate.ActorInfo, error) {
+	if uid == "" {
+		return substrate.ActorInfo{}, fmt.Errorf("exact resume requires original UID")
+	}
+	response, err := ad.ctl.ResumeActor(ctx, &atepb.ResumeActorRequest{Actor: objectRef(actor), ActorUid: uid})
+	if err != nil {
+		return substrate.ActorInfo{}, err
+	}
+	return actorInfo(response.GetActor()), nil
+}
+
+// CreateActorWithRequirementOperation uses the owning control API's atomic
+// original-response operation. Retire/lookup never resume or prove enforcement.
+func (ad *Adapter) CreateActorWithRequirementOperation(ctx context.Context, actor substrate.ActorRef, template substrate.ObjectRef, raw []byte, operationID string, lookupOnly, retireOnly bool) (substrate.ActorInfo, error) {
+	a, err := ad.ctl.CreateActor(ctx, &atepb.CreateActorRequest{Actor: &atepb.Actor{Metadata: &atepb.ResourceMetadata{Atespace: actor.Atespace, Name: actor.Name}, ActorTemplate: templateRef(template), ExecutionRequirement: append([]byte(nil), raw...)}, OperationId: operationID, LookupOnly: lookupOnly, RetireOperation: retireOnly})
+	if status.Code(err) == codes.NotFound {
+		return substrate.ActorInfo{}, fmt.Errorf("%w: %w", substrate.ErrActorNotFound, err)
+	}
+	if status.Code(err) == codes.AlreadyExists {
+		return substrate.ActorInfo{}, fmt.Errorf("%w: %w", substrate.ErrActorExists, err)
+	}
+	if err != nil {
+		return substrate.ActorInfo{}, err
+	}
+	return actorInfo(a), nil
 }

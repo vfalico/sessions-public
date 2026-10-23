@@ -69,6 +69,7 @@ type Option func(*options)
 
 type options struct {
 	executors ToolExecutorFunc
+	owned     map[string]placement.Backend
 	// output receives command-line errors and the usage; nil is os.Stderr. Tests set it.
 	output io.Writer
 	// ctx, when set, is the parent of Run's signal context, so a test can stop Run; listening is
@@ -192,6 +193,13 @@ func Run(args []string, opts ...Option) error {
 		}
 	}
 
+	// Validate configured ownership before journal creation. Owned entries never
+	// inherit host model/stream/tool functions, even when -model is configured.
+	for name, backend := range o.owned {
+		if name == "" || name == "echo" || (name == "chat" && *model != "") || backend == nil || remotes[name] != "" {
+			return errors.New("invalid or conflicting owned runtime entry")
+		}
+	}
 	store, err := sqlitelog.Open(*journal, sqlitelog.WithDefaultProject(*project))
 	if err != nil {
 		return fmt.Errorf("open journal %s: %w", *journal, err)
@@ -203,7 +211,7 @@ func Run(args []string, opts ...Option) error {
 		return err
 	}
 
-	registry, closeBackends, err := harnessRegistry(*model, remotes, modelFn, streamFn, logger, executors)
+	registry, closeBackends, err := harnessRegistry(*model, remotes, modelFn, streamFn, logger, executors, o.owned)
 	if err != nil {
 		return err
 	}
@@ -579,7 +587,7 @@ func toolExecutors(remotes remoteHarnesses, f ToolExecutorFunc, sessions *client
 //
 // executors holds the host tool executor for each -harness name that has one; the built-in
 // harnesses call no host-mediated tools and get none.
-func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger, executors map[string]controller.ToolFunc) (*placement.Registry, func(), error) {
+func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger, executors map[string]controller.ToolFunc, owned ...map[string]placement.Backend) (*placement.Registry, func(), error) {
 	echo := local.New(echoagent.Harness{}, local.WithLogger(logger))
 	backends := []*local.Backend{echo}
 	var remoteBackends []*remote.Backend
@@ -624,6 +632,15 @@ func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.M
 		backend := remote.New(addr, remote.WithLogger(logger))
 		remoteBackends = append(remoteBackends, backend)
 		placers[name] = placement.New(backend, modelFn, optsFor(name)...)
+	}
+	for _, entries := range owned {
+		for name, backend := range entries {
+			if name == "" || name == "echo" || backend == nil || placers[name] != nil {
+				closeBackends()
+				return nil, nil, errors.New("invalid or conflicting owned runtime entry")
+			}
+			placers[name] = placement.New(backend, nil, placement.WithLogger(logger))
+		}
 	}
 	// The -harness names are static entries, so ReserveStaticHarnessNames reserves them along with
 	// the built-in ones.

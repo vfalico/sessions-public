@@ -48,8 +48,8 @@ func (s *Store) CreateOwnedSession(m SessionMeta, owner api.CallerIdentity, regi
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Target only the UID conflict: a CHECK or other integrity failure is not a duplicate.
-	result, err := tx.Exec(`INSERT INTO sessions(session, owner_issuer, owner_subject, compute_state)
-		VALUES(?, ?, ?, 'NONE') ON CONFLICT(session) DO NOTHING`, m.UID, owner.Issuer, owner.Subject)
+	result, err := tx.Exec(`INSERT INTO sessions(session, owner_issuer, owner_subject, compute_state, execution_requirement)
+		VALUES(?, ?, ?, 'NONE', ?) ON CONFLICT(session) DO NOTHING`, m.UID, owner.Issuer, owner.Subject, []byte(m.ExecutionRequirement))
 	if err != nil {
 		return fmt.Errorf("sqlitelog: insert owned session %q: %w", m.UID, err)
 	}

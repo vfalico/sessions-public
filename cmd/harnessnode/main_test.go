@@ -22,6 +22,7 @@ func TestSelectHarness(t *testing.T) {
 		{"counter", "counter", "", "counter", api.ResumabilityRequiresMemorySnapshot},
 		{"existing fallback", "unknown", "", "echo", api.ResumabilityStatelessReplay},
 		{"chat", "chat", "test-model", "chat", api.ResumabilityStatelessReplay},
+		{"toolchat", "toolchat", "test-model", "toolchat", api.ResumabilityStatelessReplay},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("HARNESS_KIND", tt.kind)
@@ -59,5 +60,62 @@ func TestSelectChatRequiresModel(t *testing.T) {
 	}
 	if harness != nil {
 		t.Fatal("invalid chat configuration returned a fallback harness")
+	}
+}
+
+func TestNativeProviderConfigurationIsExplicit(t *testing.T) {
+	for _, mode := range []string{"legacy", "host", "native", "bad-mode", "missing-base", "non-chat", "keyed-insecure"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("HARNESS_KIND", "chat")
+			t.Setenv("HARNESS_MODEL", "test")
+			t.Setenv("HARNESS_MODEL_BASE_URL", "http://127.0.0.1:1")
+			t.Setenv("HARNESS_MODEL_API_KEY", "")
+			t.Setenv("HARNESS_MODEL_PLACEMENT", "native")
+			switch mode {
+			case "legacy":
+				t.Setenv("HARNESS_MODEL_PLACEMENT", "")
+			case "host":
+				t.Setenv("HARNESS_MODEL_PLACEMENT", "host")
+			case "bad-mode":
+				t.Setenv("HARNESS_MODEL_PLACEMENT", "typo")
+			case "missing-base":
+				t.Setenv("HARNESS_MODEL_BASE_URL", "")
+			case "non-chat":
+				t.Setenv("HARNESS_KIND", "echo")
+			case "keyed-insecure":
+				t.Setenv("HARNESS_MODEL_API_KEY", "fixture")
+				t.Setenv("HARNESS_MODEL_BASE_URL", "http://example.invalid")
+			}
+			h, err := selectHarness()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = configuredServer(h)
+			valid := mode == "legacy" || mode == "host" || mode == "native"
+			if (err == nil) != valid {
+				t.Fatal(mode, err)
+			}
+		})
+	}
+}
+
+func TestToolchatRequiresExplicitNativePlacement(t *testing.T) {
+	for _, mode := range []string{"", "host", "native"} {
+		t.Run("placement-"+mode, func(t *testing.T) {
+			t.Setenv("HARNESS_KIND", "toolchat")
+			t.Setenv("HARNESS_MODEL", "fixture")
+			t.Setenv("HARNESS_MODEL_PLACEMENT", mode)
+			t.Setenv("HARNESS_MODEL_BASE_URL", "http://127.0.0.1:1")
+			t.Setenv("HARNESS_MODEL_API_KEY", "")
+			t.Setenv("HARNESS_MODEL_PATH", "")
+			h, err := selectHarness()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = configuredServer(h)
+			if (err == nil) != (mode == "native") {
+				t.Fatal(mode, err)
+			}
+		})
 	}
 }

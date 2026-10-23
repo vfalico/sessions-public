@@ -379,7 +379,9 @@ func (s *resumeSink) ToolCall(ctx context.Context, tc api.ToolCall) (api.ToolRes
 		}
 		// Only a terminal intent is re-driven under its recorded key. Executor errors are live
 		// outcomes, not evidence failures: the harness may handle them and finish the turn.
-		return s.live.execTool(ctx, *call.ToolCall)
+		execution := *call.ToolCall
+		execution.InvokeNative = tc.InvokeNative // exact request matched; callback is live transport only.
+		return s.live.execTool(ctx, execution)
 	}
 	return s.live.toolCall(ctx, tc)
 }

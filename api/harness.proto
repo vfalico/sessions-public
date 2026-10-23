@@ -110,6 +110,8 @@ message ControllerFrame {
     ApprovalResult approval = 5; // host-owned committed decision, before the correlated tool receipt
     ToolResult tool = 6;         // result for a CONTROLLER_MEDIATED or decided REQUIRES_APPROVAL call
     ModelResult model = 7;       // served completion for a mediated/replayed model call
+    string native_model_call_id = 9; // transport-only live invocation grant
+    string native_tool_call_id = 10; // transport-only live tool invocation grant
     ApprovalRef park = 8;        // host-owned unresolved request; requires correlated EVENT_PARKED
   }
 }

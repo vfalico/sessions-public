@@ -16,8 +16,9 @@ import (
 	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
-// DeleteSession acknowledges permanent durable intent only. It does not resolve a harness or
-// contact runtime resources; the retained compute projection is not a cleanup claim.
+// DeleteSession persists permanent intent first. Governed sessions then attempt
+// exact-incarnation cleanup under the same admission guard. PENDING and the
+// retained compute projection are never represented as cleanup completion.
 func (s *Service) DeleteSession(ctx context.Context, req *v1.DeleteSessionRequest) (session *v1.Session, err error) {
 	ctx = observability.EnsureRequestID(ctx)
 	uid := req.GetUid()
@@ -27,11 +28,19 @@ func (s *Service) DeleteSession(ctx context.Context, req *v1.DeleteSessionReques
 		return nil, status.Error(codes.InvalidArgument, "uid is required")
 	}
 	var info sqlitelog.SessionInfo
-	// The callback calls only the atomic store primitive, never a guarded Placer method.
+	// Cleanup runs under this existing guard, never a nested guarded method.
 	err = s.registry.WithSessionGuard(uid, func() error {
 		var err error
 		info, err = s.store.DeleteSession(ctx, uid)
-		return err
+		if err != nil {
+			return err
+		}
+		if info.ExecutionRequirement != "" {
+			if err := s.registry.RetireGovernedUnderDeleteGuard(ctx, s.store.Session(uid), uid, info.Harness, []byte(info.ExecutionRequirement)); err != nil {
+				return fmt.Errorf("durable deletion pending exact retirement: %w", err)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, deleteError(err, uid)

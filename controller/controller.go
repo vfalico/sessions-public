@@ -524,7 +524,19 @@ func (c *Controller) emitDelta(executionID string, partIndex int32, chunk string
 // configured. Either way it returns the complete response, which is what gets recorded: the chunks
 // are a view of the call in progress, not the record of it.
 func (c *Controller) invokeModel(ctx context.Context, executionID string, req api.ModelRequest) (api.ModelResponse, error) {
+	if req.Native {
+		if req.InvokeNative == nil {
+			return api.ModelResponse{}, errors.New("native provider exchange unavailable")
+		}
+		return req.InvokeNative(ctx)
+	}
+	if req.InvokeNative != nil {
+		return api.ModelResponse{}, errors.New("native exchange without native request")
+	}
 	if c.stream == nil {
+		if c.model == nil {
+			return api.ModelResponse{}, errors.New("host model callback is not configured")
+		}
 		return c.model(ctx, req)
 	}
 	var index int32

@@ -433,10 +433,12 @@ func (x *ComputeRef) GetFenceToken() int64 {
 }
 
 type Session struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Metadata *ResourceMetadata      `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
-	Harness  string                 `protobuf:"bytes,2,opt,name=harness,proto3" json:"harness,omitempty"`
-	Model    string                 `protobuf:"bytes,3,opt,name=model,proto3" json:"model,omitempty"` // model-agnostic id
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Mandatory opaque whole-execution input; immutable for this session.
+	ExecutionRequirement []byte            `protobuf:"bytes,18,opt,name=execution_requirement,json=executionRequirement,proto3" json:"execution_requirement,omitempty"`
+	Metadata             *ResourceMetadata `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	Harness              string            `protobuf:"bytes,2,opt,name=harness,proto3" json:"harness,omitempty"`
+	Model                string            `protobuf:"bytes,3,opt,name=model,proto3" json:"model,omitempty"` // model-agnostic id
 	// Every Session reply uses the same append-transaction projection at last_seq: no events
 	// before deletion reports EXEC_PENDING; a valid owned unanswered host approval request in the
 	// latest first-seen execution reports EXEC_AWAITING; other histories retain EXEC_COMPLETED.
@@ -496,6 +498,13 @@ func (x *Session) ProtoReflect() protoreflect.Message {
 // Deprecated: Use Session.ProtoReflect.Descriptor instead.
 func (*Session) Descriptor() ([]byte, []int) {
 	return file_session_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *Session) GetExecutionRequirement() []byte {
+	if x != nil {
+		return x.ExecutionRequirement
+	}
+	return nil
 }
 
 func (x *Session) GetMetadata() *ResourceMetadata {
@@ -1740,8 +1749,9 @@ const file_session_proto_rawDesc = "" +
 	"fenceToken\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe8\a\n" +
-	"\aSession\x12>\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9d\b\n" +
+	"\aSession\x123\n" +
+	"\x15execution_requirement\x18\x12 \x01(\fR\x14executionRequirement\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".agentsessions.v1.ResourceMetadataR\bmetadata\x12\x18\n" +
 	"\aharness\x18\x02 \x01(\tR\aharness\x12\x14\n" +
 	"\x05model\x18\x03 \x01(\tR\x05model\x12:\n" +

@@ -10,7 +10,10 @@
 // specifics ride in Origin, annotations, and ComputeRef.Attributes.
 package api
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // EventKind classifies an Event. Typed events (vs opaque messages) are what make
 // provenance, audit, cost, and tool-approval first-class.
@@ -153,10 +156,19 @@ type ExecutionStart struct {
 // Lifecycle marks a compute/session transition in the log (§7). Baseline is a replay /
 // compaction checkpoint (§1).
 type Lifecycle struct {
+	// Host-owned COMPUTE_OWNED authority, committed while compute is suspended.
+	// These opaque fields are cleanup-only; never proof of active enforcement.
+	ComputeID          string
+	ComputeRuntime     string
+	ComputeHarness     string
+	ComputeRequirement []byte
+	ComputeOperation   []byte
+
 	Kind     LifecycleKind
 	Detail   string
 	Snapshot *SnapshotRef // captured state, set on SUSPEND (§5.1)
-	// ComputeInstance is set only on FORK: Incarnation.ComputeInstance of the compute the child was
+	// ComputeInstance is set on COMPUTE_OWNED (exact suspended cleanup authority) or
+	// FORK: Incarnation.ComputeInstance of the compute the child was
 	// cloned onto. The child's turns are compared with it until the child records its own; empty
 	// (a stateless fork, or a marker written before the field existed) compares nothing.
 	ComputeInstance string
@@ -166,16 +178,19 @@ type Lifecycle struct {
 type LifecycleKind string
 
 const (
-	LifecycleSuspend  LifecycleKind = "SUSPEND"
-	LifecycleResume   LifecycleKind = "RESUME"
-	LifecycleFork     LifecycleKind = "FORK"
-	LifecycleBaseline LifecycleKind = "BASELINE"
-	LifecycleCancel   LifecycleKind = "CANCEL"
-	LifecycleDelete   LifecycleKind = "DELETE" // host-owned permanent intent, not compute teardown
+	LifecycleSuspend         LifecycleKind = "SUSPEND"
+	LifecycleResume          LifecycleKind = "RESUME"
+	LifecycleFork            LifecycleKind = "FORK"
+	LifecycleBaseline        LifecycleKind = "BASELINE"
+	LifecycleCancel          LifecycleKind = "CANCEL"
+	LifecycleComputeOwned    LifecycleKind = "COMPUTE_OWNED"
+	LifecycleComputePrepared LifecycleKind = "COMPUTE_PREPARED"
+	LifecycleDelete          LifecycleKind = "DELETE" // host-owned permanent intent, not compute teardown
 )
 
 // ModelCall records a call to a model (model-agnostic) for audit and cost.
 type ModelCall struct {
+	Native    bool `json:",omitempty"` // provider belongs to the harness boundary, not an enforcement proof
 	Model     string
 	Params    map[string]string
 	InputHash string // required for STATELESS_REPLAY so the §9.1 I0 check can run
@@ -217,6 +232,12 @@ const (
 // ToolCall is a tool invocation. Its shape aligns with an MCP tool call (name +
 // structured arguments) so MCP tools map onto it directly.
 type ToolCall struct {
+	// Native binds tool placement to the harness boundary and is part of the
+	// immutable recorded request identity. Zero preserves legacy journal hashes.
+	Native bool `json:",omitempty"`
+	// InvokeNative is a live transport grant, never durable evidence. Replay
+	// serves the journal and does not invoke it. It must not execute on the host.
+	InvokeNative   func(context.Context) (ToolResult, error) `json:"-"`
 	ID             string
 	Tool           string // tool name / MCP method
 	Args           map[string]any

@@ -90,11 +90,11 @@ type TokenMinter func(ctx context.Context, audience []string) (string, error)
 // EventSink is the harness author's handle for emitting events. The SDK hides the gRPC
 // stream, sequence assignment, and the emit -> wait-for-host round-trip.
 type EventSink interface {
-	// Model performs a model call and returns the completion. Live: the host invokes the
-	// model and records the result. Replay: the host serves the recorded result from the
-	// journal and does not invoke the model. Because the result flows back through this
-	// mediated call, the harness never touches a provider SDK directly — the load-bearing
-	// replay rule. Reasoning parts ride in the returned ModelResponse.Message and are
+	// Model performs a model call and returns the completion. Live: the host journals
+	// intent, then invokes its provider or grants a correlated native harness provider
+	// exchange. NativeServer keeps provider IO in the harness boundary. Replay serves
+	// the recorded result without invoking either provider or issuing a native grant.
+	// Reasoning parts ride in the returned ModelResponse.Message and are
 	// recorded verbatim for replay/fork continuity (I2). The completion is recorded as the
 	// turn's output by the host; do not also emit the same content via Output (double-record).
 	//
@@ -124,6 +124,14 @@ type EventSink interface {
 // the first three carry `json:",omitempty"`: a request that does not use them hashes exactly as it
 // did before they existed, and logs recorded earlier keep replaying.
 type ModelRequest struct {
+	// Native marks a provider invocation owned by the harness boundary. It is
+	// covered by the input hash so recovery cannot switch placement silently.
+	Native bool `json:",omitempty"`
+	// InvokeNative is a correlated transport exchange, not a host provider.
+	// It is invoked only on live/recovery after recording MODEL_CALL. Replay
+	// never invokes it. It must execute within the selected harness boundary.
+	InvokeNative func(context.Context) (ModelResponse, error) `json:"-"`
+
 	Model    string
 	Messages []Message // context (history + new input) sent to the model
 	Params   map[string]string

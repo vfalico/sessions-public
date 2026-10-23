@@ -29,3 +29,5 @@ require (
 )
 
 replace github.com/agent-primitives/sessions => ../..
+
+replace github.com/agent-substrate/substrate => ../../../substrate-sessions

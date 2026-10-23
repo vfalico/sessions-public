@@ -32,15 +32,16 @@ const (
 // SessionMeta is mutable workload and provenance metadata, separate from verified caller
 // ownership. It is durable before the first event, making empty sessions listable.
 type SessionMeta struct {
-	UID       string
-	Project   string
-	Name      string
-	Harness   string
-	Model     string
-	ParentUID string // set iff this session was forked
-	ForkSeq   int64  // parent event seq forked at
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ExecutionRequirement string // immutable at first insert, exact original bytes
+	UID                  string
+	Project              string
+	Name                 string
+	Harness              string
+	Model                string
+	ParentUID            string // set iff this session was forked
+	ForkSeq              int64  // parent event seq forked at
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 
 	// Caller-supplied metadata, carried as proto3-JSON. The store round-trips these without
 	// interpreting them: they describe a session, they do not control it. Identity especially is
@@ -150,8 +151,8 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 	result, err := db.Exec(
 		`INSERT INTO sessions(session, fence, project, name, harness, model,
 		                      parent_uid, fork_seq, compute_state, created_at, updated_at,
-		                      labels, annotations, origin, identity)
-		 VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                      labels, annotations, origin, identity, execution_requirement)
+		 VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session) DO UPDATE SET
 		   project     = excluded.project,
 		   name        = excluded.name,
@@ -166,10 +167,10 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 		   created_at  = CASE WHEN ? OR sessions.created_at = 0
 		                     THEN excluded.created_at ELSE sessions.created_at END,
 		   updated_at  = excluded.updated_at
-		 WHERE sessions.deletion_state = 'ACTIVE'`,
+		 WHERE sessions.deletion_state = 'ACTIVE' AND sessions.execution_requirement = excluded.execution_requirement`,
 		m.UID, m.Project, m.Name, m.Harness, m.Model,
 		m.ParentUID, m.ForkSeq, string(api.ComputeNone), created.UnixNano(), now.UnixNano(),
-		m.Labels, m.Annotations, m.Origin, m.Identity,
+		m.Labels, m.Annotations, m.Origin, m.Identity, []byte(m.ExecutionRequirement),
 		explicitCreated,
 	)
 	if err != nil {
@@ -192,7 +193,7 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 const sessionSelect = `
 SELECT s.session, s.project, s.name, s.harness, s.model, s.parent_uid, s.fork_seq,
        s.compute_state, s.created_at, s.updated_at,
-       s.labels, s.annotations, s.origin, s.identity, s.owner_issuer, s.owner_subject,
+       s.labels, s.annotations, s.origin, s.identity, s.execution_requirement, s.owner_issuer, s.owner_subject,
        s.deletion_state, s.deletion_requested_at, s.deletion_seq,
        (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = s.session),
        CASE WHEN s.last_seq = (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = s.session)
@@ -308,7 +309,7 @@ func scanSession(row scanner) (SessionInfo, error) {
 	if err := row.Scan(
 		&info.UID, &info.Project, &info.Name, &info.Harness, &info.Model,
 		&info.ParentUID, &info.ForkSeq, &state, &createdAt, &updatedAt,
-		&info.Labels, &info.Annotations, &info.Origin, &info.Identity, &info.Owner.Issuer, &info.Owner.Subject,
+		&info.Labels, &info.Annotations, &info.Origin, &info.Identity, &info.ExecutionRequirement, &info.Owner.Issuer, &info.Owner.Subject,
 		&deletionState, &requested, &info.DeletionSeq,
 		&info.LastSeq, &info.PendingApproval.RequestSeq,
 		&info.PendingApproval.ExecutionID, &info.PendingApproval.ToolCallID,

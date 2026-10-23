@@ -135,7 +135,7 @@ func (m *mockControl) GetActor(ctx context.Context, a substrate.ActorRef) (subst
 		if m.getNoUID {
 			uid = ""
 		}
-		return substrate.ActorInfo{Status: st, Worker: m.info.Worker, Snapshot: m.snapshots[a.Name], UID: uid}, nil
+		return substrate.ActorInfo{Status: st, Worker: m.info.Worker, Snapshot: m.snapshots[a.Name], UID: uid, ExecutionRequirement: m.info.ExecutionRequirement}, nil
 	}
 	if m.status != substrate.StatusUnknown { // canned state for the suspend/restore cases
 		return substrate.ActorInfo{Status: m.status, Worker: m.info.Worker, Snapshot: m.snapshots[a.Name], UID: m.uid(a.Name)}, nil
@@ -219,7 +219,7 @@ func TestCreateBootsActor(t *testing.T) {
 		ID:           "sess-x",
 		Worker:       "worker-a",
 		Address:      substrate.DefaultRouterAddress,
-		CallMetadata: map[string]string{"ate-target-actor": "space/sess-x"},
+		CallMetadata: map[string]string{"ate-target-actor": "space/sess-x", "ate-target-actor-uid": "uid-sess-x-1"},
 		Runtime:      "substrate",
 	}
 	if !reflect.DeepEqual(in, want) {
@@ -360,10 +360,11 @@ func TestSnapshotLocalUnsupported(t *testing.T) {
 
 func TestStopSuspendsThenDeletes(t *testing.T) {
 	m := &mockControl{}
+	m.exists("sess-x", substrate.StatusRunning)
 	if err := newBackend(m).Stop(context.Background(), api.Incarnation{ID: "sess-x"}); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"suspend:sess-x", "delete:sess-x"}; !reflect.DeepEqual(m.calls, want) {
+	if want := []string{"get:sess-x", "suspend:sess-x", "delete:sess-x"}; !reflect.DeepEqual(m.calls, want) {
 		t.Fatalf("stop calls=%v want %v (delete requires SUSPENDED first)", m.calls, want)
 	}
 }
@@ -631,7 +632,7 @@ func TestForkTearsDownACloneThatIsNotRunning(t *testing.T) {
 	}
 	want := []string{
 		"get:parent", "tag:parent->fork-child", "get:parent", "clone:child:from=fork-child", "resume:child",
-		"suspend:child", "delete:child", "untag:fork-child",
+		"get:child", "suspend:child", "delete:child", "untag:fork-child",
 	}
 	if !reflect.DeepEqual(m.calls, want) {
 		t.Fatalf("calls=%v want the stranded clone torn down %v", m.calls, want)
@@ -670,13 +671,13 @@ func TestForkRefusesACloneReplacedBeforeItsResume(t *testing.T) {
 			resumeErr: notFound, wantCalls: append(slices.Clone(head), "get:child", "untag:fork-child"), wantBusy: true,
 			wantErr: notFound, wantMsg: "was deleted between its create and resume"},
 		{name: "resume fails on the clone: the clone is torn down", resumeErr: resumeFailed,
-			wantCalls: append(slices.Clone(head), "get:child", "suspend:child", "delete:child", "untag:fork-child"), wantErr: resumeFailed},
+			wantCalls: append(slices.Clone(head), "get:child", "get:child", "suspend:child", "delete:child", "untag:fork-child"), wantErr: resumeFailed},
 		{name: "the cleanup read fails: nothing is touched",
 			afterClone: func(m *mockCloner, _ string) { m.getErr = errRead }, resumeErr: resumeFailed,
 			wantCalls: append(slices.Clone(head), "get:child"), wantErr: resumeFailed, wantMsg: "were left in place"},
 		{name: "a clone reported without a UID is torn down before its resume", noUID: true,
 			wantCalls: []string{"get:parent", "tag:parent->fork-child", "get:parent", "clone:child:from=fork-child",
-				"suspend:child", "delete:child", "untag:fork-child"}, wantMsg: "reported no actor UID"},
+				"get:child", "suspend:child", "delete:child", "untag:fork-child"}, wantMsg: "reported no actor UID"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newClonerWithSuspendedParent()

@@ -63,6 +63,10 @@ func latestComputeInstance(recs []eventlog.Record, sameHarness func(string) bool
 			if ev.Lifecycle.ComputeInstance != "" && counts("") {
 				instance, seq, fork = ev.Lifecycle.ComputeInstance, recs[i].Seq, true
 			}
+		case ev.Kind == api.EventLifecycle && ev.Lifecycle != nil && ev.Lifecycle.Kind == api.LifecycleComputeOwned && ev.Lifecycle.ComputeInstance != "":
+			if counts(ev.Lifecycle.ComputeHarness) {
+				instance, seq, fork = ev.Lifecycle.ComputeInstance, recs[i].Seq, false
+			}
 		case ev.Kind == api.EventExecutionStart && ev.ExecutionStart != nil && ev.ExecutionStart.ComputeInstance != "":
 			if counts(ev.ExecutionStart.Harness) {
 				instance, seq, fork = ev.ExecutionStart.ComputeInstance, recs[i].Seq, false

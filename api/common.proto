@@ -144,6 +144,7 @@ message ModelCall {
   // tool_choice constrains whether and which tool the model calls. Wire-only like messages and
   // covered by input_hash. Unset means the provider default.
   ToolChoice tool_choice = 7;
+  bool native = 8; // provider invocation belongs to harness; host only records/replays
 }
 
 // ToolDefinition is a tool offered to a model on one call. It aligns with an MCP Tool (name,
@@ -182,6 +183,7 @@ message ToolCall {
   google.protobuf.Struct args = 3;
   Mediation mediation = 4;
   string idempotency_key = 5; // §3/I3: dedups a retried side-effecting call tool-side
+  bool native = 6; // tool invocation belongs to the harness; covered by request identity
 }
 
 // ToolResult is a durable execution receipt, also usable as model-facing history. A decision
@@ -272,6 +274,12 @@ message Lifecycle {
     // Host-owned, session-scoped permanent deletion intent (empty Event.execution_id).
     // It fences writes but does not terminate compute or confirm resource reclamation.
     LIFECYCLE_DELETE = 6;
+    // Host-owned exact cleanup authority before governed compute resumes.
+    // Never execution-start, active-enforcement proof or permission to dispatch.
+    LIFECYCLE_COMPUTE_OWNED = 7;
+    // Host-authored opaque owner operation, durable before creating RPC.
+    // Never active enforcement or dispatch authority.
+    LIFECYCLE_COMPUTE_PREPARED = 8;
   }
   Kind kind = 1;
   string detail = 2; // e.g. "fork parent=<uid>@<seq>", baseline id
@@ -284,13 +292,24 @@ message Lifecycle {
   string snapshot_external_uri = 4;
   bool snapshot_memory = 5;
   bool snapshot_sealed = 6;
-  // Set only on FORK: the identity of the compute instance the child was cloned onto, in the
+  // Set on COMPUTE_OWNED for exact suspended cleanup authority, or on FORK for
+  // the identity of the compute instance the child was cloned onto, in the
   // same form as ExecutionStart.compute_instance (substrate: the cloned actor's UID). The child's
   // turns are compared with it until the child records one of its own, so a turn, Resume,
   // Suspend or Fork placed on another instance before the child's first turn is refused. Empty
   // means not recorded (a stateless fork, or a marker written before this field existed), and
   // the child's first turn is not compared.
   string compute_instance = 7;
+  // COMPUTE_OWNED only: original incarnation handle, never a workload identity.
+  string compute_id = 8;
+  // COMPUTE_OWNED only: owning runtime label; opaque to the session controller.
+  string compute_runtime = 9;
+  // COMPUTE_OWNED only: resolved host registry name, not harness self-assertion.
+  string compute_harness = 10;
+  // COMPUTE_OWNED only: frozen original requirement. No active-policy authority.
+  bytes compute_requirement = 11;
+  // COMPUTE_PREPARED only: original opaque owning-backend operation descriptor.
+  bytes compute_operation = 12;
 }
 
 // ExecutionStart is host-owned invocation state, committed before inputs and harness execution.
@@ -343,6 +362,8 @@ enum EventKind {
   // Harness acknowledgement of ControllerFrame.park with the exact ApprovalRef. Transport only:
   // the host MUST NOT journal/hash-chain it or treat it as a terminal execution outcome.
   EVENT_PARKED = 13;
+  EVENT_NATIVE_MODEL_RESULT = 14; // correlated transport-only completion, never journaled
+  EVENT_NATIVE_TOOL_RESULT = 15; // correlated transport-only completion, never journaled
 }
 
 // Event is the shared journal/stream content unit; EXECUTION_START, APPROVAL_REQUEST and
@@ -373,6 +394,8 @@ message Event {
     ExecutionStart execution_start = 19;
     // EVENT_PARKED echoes the park reference; Event.execution_id must match its execution_id.
     ApprovalRef parked = 20;
+    NativeModelCompletion native_model = 21;
+    NativeToolCompletion native_tool = 22;
   }
 
   IdentityRef actor = 18; // emitter principal -> provenance
@@ -389,4 +412,22 @@ message LogRecord {
   string content_hash = 3;
   int64 fence = 4;
   Event event = 5;
+}
+
+// Native provider completion over the already-owned harness stream. This is
+// not an enforcement proof. The host issues a per-call grant only on live
+// execution after MODEL_CALL is journaled; replay sends its recorded result.
+message NativeModelCompletion {
+ string model_call_id = 1;
+ Message message = 2;
+ Usage usage = 3;
+ string error = 4;
+}
+
+// A live native tool completion, never a journal event or enforcement proof.
+// The host grants only after recording TOOL_CALL; replay sends recorded results.
+message NativeToolCompletion {
+ string tool_call_id = 1;
+ ToolResult result = 2;
+ string error = 3;
 }

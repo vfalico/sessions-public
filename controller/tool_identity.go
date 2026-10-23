@@ -25,10 +25,15 @@ func matchToolCall(emitted api.ToolCall, recorded *api.ToolCall) error {
 	default:
 		return fmt.Errorf("%w: invalid recorded tool mediation: %w", ErrReplayDiverged, ErrUnmediatedToolCall)
 	}
+	if recorded.Native && (recorded.ID == "" || recorded.Mediation != api.MediationControllerMediated) {
+		return fmt.Errorf("%w: invalid native tool identity", ErrReplayDiverged)
+	}
 	if recorded.IdempotencyKey == "" {
 		return fmt.Errorf("%w: invalid recorded tool key: %w", ErrReplayDiverged, ErrMissingIdempotencyKey)
 	}
 	switch {
+	case emitted.Native != recorded.Native:
+		return fmt.Errorf("%w: tool placement mismatch", ErrReplayDiverged)
 	case emitted.ID != recorded.ID:
 		return fmt.Errorf("%w: tool call ID mismatch", ErrReplayDiverged)
 	case emitted.Tool != recorded.Tool:

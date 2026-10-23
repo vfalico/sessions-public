@@ -142,14 +142,35 @@ type Incarnation struct {
 	// fork pass that recorded instance to Snapshot, which refuses another one.
 	// Empty records nothing and skips the check.
 	ComputeInstance string
+	// ExecutionRequirement retains original governed cleanup intent. It is opaque
+	// policy data, not routing metadata, and must accompany durable retirement.
+	// Stop must not downgrade to snapshot/delete if a fresh control observation
+	// loses these bytes under the same compute identity.
+	ExecutionRequirement []byte
 }
 
 // SessionSpec is what a Runtime needs to create an incarnation.
 type SessionSpec struct {
-	SessionUID string
-	Image      string
-	Harness    string
-	Identity   IdentityRef
+	// ComputeOperation is an opaque host-retained owner-side create operation.
+	// It is prepared and journaled BEFORE any creating RPC; never activation proof.
+	ComputeOperation []byte
+
+	// ExpectedComputeInstance is the original host-journal identity for this
+	// harness since the last FORK. A governed backend must refuse a different
+	// or missing target before verification, resume, or new compute creation.
+	// Empty means no prior identity was recorded, not wildcard replacement.
+	ExpectedComputeInstance string
+
+	// RetainCompute commits exact runtime-owned cleanup authority before an
+	// owning backend may resume governed compute. An error forbids resume.
+	// This is not workload dispatch or an enforcement acknowledgement.
+	RetainCompute func(Incarnation) error
+
+	ExecutionRequirement []byte // mandatory opaque whole-execution input
+	SessionUID           string
+	Image                string
+	Harness              string
+	Identity             IdentityRef
 	// StartedTurns counts the turns the session's journal records as started (an EXECUTION_START) on
 	// the harness being placed, whether they completed, failed or were interrupted: any of them may
 	// have changed that harness's in-memory state. For a forked child it counts the turns of the copied
@@ -182,4 +203,17 @@ type RuntimeCapabilities struct {
 	CoWFork        bool // copy-on-write fork
 	Attest         bool // attestation on restore (confidential)
 	GPUState       bool // accelerator state capture
+}
+
+// ExecutionRequirementRuntime is an explicit owning-backend admission seam.
+// Only isolated backends that carry exact requirements before compute start implement it.
+type ExecutionRequirementRuntime interface{ ExecutionRequirementRuntime() }
+
+// ExecutionOperationRuntime is an optional owning-backend extension for durable
+// uncertain-Create recovery. Prepare is side-effect-free. Retire is atomic
+// cancel-or-original plus exact compute stop, never create/resume/activation.
+// Descriptor contents belong to the backend; core stores opaque frozen bytes.
+type ExecutionOperationRuntime interface {
+	PrepareExecutionOperation(string, []byte) ([]byte, error)
+	RetireExecutionOperation(context.Context, []byte) error
 }

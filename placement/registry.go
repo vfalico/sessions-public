@@ -1,6 +1,7 @@
 package placement
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -497,4 +498,128 @@ func (r *Registry) Names() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// RetireGovernedUnderDeleteGuard is cleanup-only: the caller already owns
+// WithSessionGuard and has persisted DELETE. It never admits or creates work.
+// Authority comes from the verified durable incarnation record, not discovery
+// under a reusable session name. PENDING remains truthful after success too.
+func (r *Registry) RetireGovernedUnderDeleteGuard(ctx context.Context, log eventlog.Store, uid, stored string, requirement []byte) error {
+	if len(requirement) == 0 {
+		return fmt.Errorf("governed retirement requires original execution requirement")
+	}
+	if err := log.Verify(); err != nil {
+		return fmt.Errorf("verify retirement journal: %w", err)
+	}
+	recs, err := log.Read(1)
+	if err != nil {
+		return err
+	}
+	if len(recs) == 0 || recs[len(recs)-1].Event.Lifecycle == nil || recs[len(recs)-1].Event.Lifecycle.Kind != api.LifecycleDelete {
+		return fmt.Errorf("retirement requires durable DELETE")
+	}
+	// Host-authored suspended ownership is independent of a turn start and
+	// survives failed Create, lost Resume reply and process restart. Retire all
+	// exact original authorities; do not collapse distinct UIDs by placer.
+	type cleanupKey struct {
+		p                     *Placer
+		id, runtime, instance string
+	}
+	ownedTargets := map[cleanupKey]api.Incarnation{}
+	type operationKey struct {
+		p          *Placer
+		descriptor string
+	}
+	operations := map[operationKey]bool{}
+	ownershipStart := 0
+	for i, record := range recs {
+		if l := record.Event.Lifecycle; record.Event.Kind == api.EventLifecycle && l != nil && l.Kind == api.LifecycleFork {
+			ownershipStart = i + 1
+		}
+	}
+	for _, record := range recs[ownershipStart:] {
+		ev := record.Event
+		if ev.Kind == api.EventLifecycle && ev.Lifecycle != nil && ev.Lifecycle.Kind == api.LifecycleComputePrepared {
+			l := ev.Lifecycle
+			if l.ComputeID != uid || l.ComputeHarness == "" || len(l.ComputeOperation) == 0 || !bytes.Equal(l.ComputeRequirement, requirement) {
+				return fmt.Errorf("invalid original compute operation")
+			}
+			if l.ComputeInstance != "" || l.ComputeRuntime != "" || l.Detail != "" || l.Snapshot != nil {
+				return fmt.Errorf("prepared operation is not execution authority")
+			}
+			p, found := r.lookup(l.ComputeHarness)
+			if !found {
+				return fmt.Errorf("original operation backend unavailable")
+			}
+			if _, ok := p.backend.(api.ExecutionOperationRuntime); !ok {
+				return fmt.Errorf("backend cannot retire original operation")
+			}
+			operations[operationKey{p, string(l.ComputeOperation)}] = true
+			continue
+		}
+		if ev.Kind != api.EventLifecycle || ev.Lifecycle == nil || ev.Lifecycle.Kind != api.LifecycleComputeOwned {
+			continue
+		}
+		l := ev.Lifecycle
+		if l.ComputeID != uid || l.ComputeInstance == "" || l.ComputeRuntime == "" || l.ComputeHarness == "" || !bytes.Equal(l.ComputeRequirement, requirement) {
+			return fmt.Errorf("invalid original durable compute ownership")
+		}
+		p, ok := r.lookup(l.ComputeHarness)
+		if !ok {
+			return fmt.Errorf("retirement harness %q unavailable", l.ComputeHarness)
+		}
+		in := api.Incarnation{ID: l.ComputeID, Runtime: l.ComputeRuntime, ComputeInstance: l.ComputeInstance, ExecutionRequirement: append([]byte(nil), l.ComputeRequirement...)}
+		ownedTargets[cleanupKey{p, in.ID, in.Runtime, in.ComputeInstance}] = in
+	}
+	// A session can have executed on an override harness. Retire every recorded
+	// placer, using only its own latest exact instance; do not route via defaults.
+	targets := map[*Placer]string{}
+	for _, record := range recs {
+		ev := record.Event
+		if ev.Kind != api.EventExecutionStart || ev.ExecutionStart == nil {
+			continue
+		}
+		name := ev.ExecutionStart.Harness
+		if name == "" {
+			name = stored
+		}
+		if name == "" {
+			return fmt.Errorf("retirement has no recorded harness")
+		}
+		p, ok := r.lookup(name)
+		if !ok {
+			return fmt.Errorf("retirement harness %q unavailable", name)
+		}
+		instance, _ := controller.LatestComputeInstance(recs, p.ranHere)
+		if instance == "" {
+			return fmt.Errorf("retirement has no exact compute identity")
+		}
+		targets[p] = instance
+	}
+	if len(targets) == 0 && len(ownedTargets) == 0 && len(operations) == 0 {
+		// Create can fail after provisioning and before EXECUTION_START. An empty
+		// journal cannot prove there is no orphan, so do not infer completion.
+		return fmt.Errorf("retirement requires a persisted exact compute identity")
+	}
+	// Atomic retirement cancels an uncommitted operation or recovers and stops
+	// its original UID. An absent lookup alone would race a delayed creating RPC.
+	for key := range operations {
+		if err := key.p.backend.(api.ExecutionOperationRuntime).RetireExecutionOperation(ctx, []byte(key.descriptor)); err != nil {
+			return err
+		}
+	}
+	for key, in := range ownedTargets {
+		if err := key.p.backend.Stop(ctx, in); err != nil {
+			return err
+		}
+		if targets[key.p] == in.ComputeInstance {
+			delete(targets, key.p)
+		}
+	}
+	for p, instance := range targets {
+		if err := p.backend.Stop(ctx, api.Incarnation{ID: uid, ComputeInstance: instance, ExecutionRequirement: append([]byte(nil), requirement...)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

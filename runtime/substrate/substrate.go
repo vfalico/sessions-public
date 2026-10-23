@@ -59,7 +59,8 @@ type ObjectRef struct {
 
 // ActorInfo is the subset of an actor's state the backend needs.
 type ActorInfo struct {
-	Status ActorStatus
+	ExecutionRequirement string
+	Status               ActorStatus
 	// Worker names the worker hosting the actor while it holds one, for diagnostics only. The backend
 	// never dials it: the harness is reached through the router, which resolves the worker per call.
 	Worker string
@@ -150,6 +151,32 @@ type SnapshotCloner interface {
 	// DeleteTag removes a tag and collects its copy of the snapshot. An actor seeded from the tag
 	// borrows that copy until its own first suspend, so a tag must outlive its unsuspended clones.
 	DeleteTag(ctx context.Context, tag SnapshotID) error
+}
+
+// ExactExecutionVerifier performs a read-only current enforcement check on the
+// exact running Actor. Metadata echo alone does not satisfy this contract.
+type ExactExecutionVerifier interface {
+	VerifyActorExecution(context.Context, ActorRef, string, []byte) error
+}
+
+// RequirementControl creates a suspended Actor with frozen exact bytes and no live compute.
+type RequirementControl interface {
+	CreateActorWithRequirement(context.Context, ActorRef, ObjectRef, []byte) error
+}
+
+// ExactRequirementControl returns server-assigned identity from suspended
+// Create and enforces the same immutable UID before Resume side effects.
+// Implementations must not recover identity by a subsequent name-only lookup.
+type ExactRequirementControl interface {
+	CreateActorWithRequirementIdentity(context.Context, ActorRef, ObjectRef, []byte) (ActorInfo, error)
+	ResumeActorExact(context.Context, ActorRef, string) (ActorInfo, error)
+}
+
+// ExactTerminator destroys the observed Actor without creating a snapshot.
+// The server must enforce uid atomically before stopping any compute. This is
+// deliberately optional so existing ungoverned backends retain their contract.
+type ExactTerminator interface {
+	TerminateActor(context.Context, ActorRef, string) error
 }
 
 // Backend implements api.Runtime over a substrate ControlClient.
@@ -261,9 +288,48 @@ func (b *Backend) Create(ctx context.Context, s *api.SessionSpec) (inc api.Incar
 	if s.SessionUID == "" {
 		return api.Incarnation{}, errCreateRequiresSessionUID
 	}
+	frozen := *s
+	frozen.ExecutionRequirement = append([]byte(nil), s.ExecutionRequirement...)
+	s = &frozen
+	if len(s.ExecutionRequirement) > 0 && len(s.ComputeOperation) > 0 {
+		return b.createWithOperation(ctx, s)
+	}
 
 	ref := b.ref(sessionUID)
-	if inc, found, err := b.attach(ctx, ref); found || err != nil {
+	if len(s.ExecutionRequirement) > 0 {
+		info, e := b.ctl.GetActor(ctx, ref)
+		if e == nil {
+			// Matching name/policy and current enforcement do not establish
+			// ownership after a lost Create reply or pre-retention caller crash.
+			// Warm authority must come from the original durable host journal.
+			if s.ExpectedComputeInstance == "" {
+				return inc, fmt.Errorf("governed attachment requires durable original compute authority; no adoption by name")
+			}
+			if info.UID != s.ExpectedComputeInstance {
+				return inc, fmt.Errorf("original governed Actor UID changed; no verification or dispatch")
+			}
+			if string(info.ExecutionRequirement) != string(s.ExecutionRequirement) {
+				return inc, fmt.Errorf("existing Actor requirement differs; no attach or resume")
+			}
+			if info.UID == "" || info.Status != StatusRunning {
+				return inc, fmt.Errorf("governed attachment requires exact running Actor; no compute resumed")
+			}
+			verifier, ok := b.ctl.(ExactExecutionVerifier)
+			if !ok {
+				return inc, fmt.Errorf("control lacks current exact enforcement verification")
+			}
+			if e = verifier.VerifyActorExecution(ctx, ref, info.UID, append([]byte(nil), s.ExecutionRequirement...)); e != nil {
+				return inc, fmt.Errorf("current exact enforcement verification failed: %w", e)
+			}
+			return b.incarnation(sessionUID, info)
+		}
+		if !errors.Is(e, ErrActorNotFound) {
+			return inc, e
+		}
+		if s.ExpectedComputeInstance != "" {
+			return inc, fmt.Errorf("original governed Actor absent; no replacement created")
+		}
+	} else if inc, found, err := b.attach(ctx, ref); found || err != nil {
 		return inc, err
 	}
 
@@ -285,12 +351,45 @@ func (b *Backend) Create(ctx context.Context, s *api.SessionSpec) (inc api.Incar
 		}
 	}
 
+	var exact ExactRequirementControl
+	var owned api.Incarnation
+	if len(s.ExecutionRequirement) != 0 {
+		var ok bool
+		exact, ok = b.ctl.(ExactRequirementControl)
+		if !ok || s.RetainCompute == nil {
+			return inc, fmt.Errorf("governed create requires exact suspended identity and durable ownership callback")
+		}
+	}
 	createFinished := observability.StartDebug(ctx, b.logger, "runtime.substrate", "create_actor",
 		"actor", ref.Name,
 		"atespace", ref.Atespace,
 	)
-	if err := b.ctl.CreateActor(ctx, ref, b.template); err != nil {
+	create := func() error {
+		if len(s.ExecutionRequirement) == 0 {
+			return b.ctl.CreateActor(ctx, ref, b.template)
+		}
+		info, err := exact.CreateActorWithRequirementIdentity(ctx, ref, b.template, append([]byte(nil), s.ExecutionRequirement...))
+		if err != nil {
+			return err
+		}
+		// Preserve only the exact creation response, even when it is malformed.
+		// No usable harness address is returned on a failed Create.
+		owned = api.Incarnation{ID: sessionUID, Runtime: "substrate", ComputeInstance: info.UID, ExecutionRequirement: append([]byte(nil), s.ExecutionRequirement...)}
+		if info.UID == "" || info.Status != StatusSuspended || info.ExecutionRequirement != string(s.ExecutionRequirement) {
+			return fmt.Errorf("governed create did not return exact suspended authority")
+		}
+		callbackOwned := owned
+		callbackOwned.ExecutionRequirement = append([]byte(nil), owned.ExecutionRequirement...)
+		if err := s.RetainCompute(callbackOwned); err != nil {
+			return fmt.Errorf("retain exact suspended compute before resume: %w", err)
+		}
+		return nil
+	}
+	if err := create(); err != nil {
 		if errors.Is(err, ErrActorExists) {
+			if len(s.ExecutionRequirement) != 0 {
+				return inc, fmt.Errorf("governed create raced existing Actor; no attach: %w", err)
+			}
 			// Another host created the actor after this call looked. Use it as that host does; the
 			// host's compute-instance check still refuses it if it replaced a lost actor.
 			createFinished(nil, "actor_exists", true)
@@ -302,7 +401,7 @@ func (b *Backend) Create(ctx context.Context, s *api.SessionSpec) (inc api.Incar
 			return inc, aerr
 		}
 		createFinished(err, "error_kind", "create_actor_failed")
-		return api.Incarnation{}, fmt.Errorf("substrate: create actor: %w", err)
+		return owned, fmt.Errorf("substrate: create actor: %w", err)
 	}
 	createFinished(nil)
 
@@ -310,14 +409,41 @@ func (b *Backend) Create(ctx context.Context, s *api.SessionSpec) (inc api.Incar
 		"actor", ref.Name,
 		"atespace", ref.Atespace,
 	)
-	info, err := b.ctl.ResumeActor(ctx, ref) // a brand-new actor has no session state to lose
+	var info ActorInfo
+	if exact != nil {
+		if err := ctx.Err(); err != nil {
+			return owned, fmt.Errorf("governed create cancelled before exact resume: %w", err)
+		}
+		info, err = exact.ResumeActorExact(ctx, ref, owned.ComputeInstance)
+	} else {
+		info, err = b.ctl.ResumeActor(ctx, ref)
+	}
 	if err != nil {
 		resumeFinished(err, "error_kind", "resume_actor_failed")
-		return api.Incarnation{}, fmt.Errorf("substrate: resume actor: %w", err)
+		return owned, fmt.Errorf("substrate: resume actor: %w", err)
+	}
+	if info.ExecutionRequirement != string(s.ExecutionRequirement) {
+		return owned, fmt.Errorf("resumed Actor requirement changed; no harness dispatch")
+	}
+	if exact != nil && info.UID != owned.ComputeInstance {
+		return owned, fmt.Errorf("resumed Actor UID changed; original cleanup authority retained")
 	}
 	resumeFinished(nil, "actor_status", info.Status)
 	inc, err = b.incarnation(sessionUID, info)
-	return inc, err
+	if err != nil {
+		return owned, err
+	}
+	if len(s.ExecutionRequirement) != 0 {
+		verifier, ok := b.ctl.(ExactExecutionVerifier)
+		if !ok {
+			return owned, fmt.Errorf("control lacks current exact enforcement verification after governed resume")
+		}
+		if err := verifier.VerifyActorExecution(ctx, ref, inc.ComputeInstance, append([]byte(nil), s.ExecutionRequirement...)); err != nil {
+			// Retain original cleanup-only authority, not a usable handle.
+			return owned, fmt.Errorf("current exact enforcement verification after governed resume failed: %w", err)
+		}
+	}
+	return inc, nil
 }
 
 // attach returns the incarnation of the session's existing actor: a RUNNING actor as it is, a
@@ -333,6 +459,10 @@ func (b *Backend) attach(ctx context.Context, ref ActorRef) (inc api.Incarnation
 		return api.Incarnation{}, false, nil
 	case err != nil:
 		return api.Incarnation{}, false, fmt.Errorf("substrate: get actor: %w", err)
+	case info.ExecutionRequirement != "":
+		// Legacy callers must not attach to (or resume) governed compute by
+		// omitting the requirement. Metadata alone is not current enforcement.
+		return api.Incarnation{}, true, fmt.Errorf("existing Actor has mandatory execution requirement; ungoverned attachment refused")
 	case info.Status == StatusRunning:
 	case info.Status == StatusSuspended:
 		seen := info
@@ -514,6 +644,7 @@ func (b *Backend) RestoreInstance(ctx context.Context, ref api.SnapshotRef, reco
 	if name == "" {
 		return api.Incarnation{}, fmt.Errorf("substrate: snapshot ref missing actor name")
 	}
+
 	resumeFinished := observability.StartDebug(ctx, b.logger, "runtime.substrate", "resume_actor",
 		"actor", name,
 		"atespace", b.atespace,
@@ -651,6 +782,7 @@ func (b *Backend) Fork(ctx context.Context, ref api.SnapshotRef, opts api.ForkOp
 	if child == "" {
 		return api.Incarnation{}, fmt.Errorf("substrate: fork requires a child session uid")
 	}
+
 	if b.descriptor.Capabilities.Resumability != api.ResumabilityRequiresMemorySnapshot {
 		inc, err := b.Create(ctx, &api.SessionSpec{SessionUID: child})
 		if err != nil {
@@ -840,6 +972,34 @@ func (b *Backend) Stop(ctx context.Context, in api.Incarnation) (err error) {
 	defer func() { finish(err, "error_kind", substrateErrorKind(err)) }()
 
 	ref := b.ref(in.ID)
+	observed, observeErr := b.ctl.GetActor(ctx, ref)
+	if errors.Is(observeErr, ErrActorNotFound) && len(in.ExecutionRequirement) > 0 && in.ComputeInstance != "" {
+		// Owner deletion commits only after native cleanup. An exact owner-side
+		// retry is safe after record deletion; never infer cleanup from reused name.
+		if terminator, ok := b.ctl.(ExactTerminator); ok {
+			return terminator.TerminateActor(ctx, ref, in.ComputeInstance)
+		}
+	}
+	if observeErr != nil {
+		return fmt.Errorf("substrate: observe before stop: %w", observeErr)
+	}
+	// A replacement must never evade identity checks by dropping policy bytes.
+	if in.ComputeInstance != "" && observed.UID != in.ComputeInstance {
+		return fmt.Errorf("substrate: original Actor UID changed before stop")
+	}
+	if len(in.ExecutionRequirement) != 0 || observed.ExecutionRequirement != "" {
+		if observed.UID == "" || in.ComputeInstance == "" || observed.UID != in.ComputeInstance {
+			return fmt.Errorf("substrate: governed termination requires original exact Actor UID")
+		}
+		terminator, ok := b.ctl.(ExactTerminator)
+		if !ok {
+			return fmt.Errorf("substrate: exact governed termination is unsupported")
+		}
+		if err := terminator.TerminateActor(ctx, ref, in.ComputeInstance); err != nil {
+			return fmt.Errorf("substrate: terminate exact governed Actor: %w", err)
+		}
+		return nil
+	}
 	suspendFinished := observability.StartDebug(ctx, b.logger, "runtime.substrate", "suspend_actor",
 		"actor", ref.Name,
 		"atespace", ref.Atespace,
@@ -917,6 +1077,7 @@ const DefaultRouterAddress = "atenet-router.ate-system.svc:80"
 // "<atespace>/<actor>". The router ignores the host and authority, so without it a call reaches no
 // actor. It mirrors substrate internal/atenet.TargetActorHeader, which is not importable.
 const TargetActorHeader = "ate-target-actor"
+const TargetActorUIDHeader = "ate-target-actor-uid"
 
 // incarnation maps a resumed actor onto the compute handle the Placer drives. Address is the router
 // and CallMetadata names the actor: substrate removed the direct pod-IP ingress, so the router is the
@@ -932,22 +1093,27 @@ func (b *Backend) incarnation(uid string, info ActorInfo) (api.Incarnation, erro
 		return api.Incarnation{}, fmt.Errorf("substrate: actor %q is %v after resume, want running", uid, info.Status)
 	}
 	instance := ""
-	if b.descriptor.Capabilities.Resumability == api.ResumabilityRequiresMemorySnapshot {
+	if b.descriptor.Capabilities.Resumability == api.ResumabilityRequiresMemorySnapshot || info.ExecutionRequirement != "" {
 		if info.UID == "" {
 			return api.Incarnation{}, fmt.Errorf("substrate: actor %s/%s reported no UID, so a replacement could not be told apart "+
 				"from the actor that holds the session's in-RAM state", b.atespace, uid)
 		}
 		instance = info.UID
 	}
+	metadata := map[string]string{TargetActorHeader: b.atespace + "/" + uid}
+	if info.UID != "" {
+		metadata[TargetActorUIDHeader] = info.UID
+	}
 	return api.Incarnation{
 		ID:           uid,
 		Worker:       info.Worker,
 		Address:      b.router,
-		CallMetadata: map[string]string{TargetActorHeader: b.atespace + "/" + uid},
+		CallMetadata: metadata,
 		Runtime:      "substrate",
-		// The router reaches the actor by name, so this records which actor the name resolved to
-		// when the backend looked, not which one the router reaches later.
-		ComputeInstance: instance,
+		// The expected UID is independently checked by ingress and the worker
+		// activation before a request can dial the named actor.
+		ComputeInstance:      instance,
+		ExecutionRequirement: append([]byte(nil), info.ExecutionRequirement...),
 	}, nil
 }
 
@@ -971,3 +1137,5 @@ func substrateErrorKind(err error) string {
 		return "runtime_operation_failed"
 	}
 }
+
+func (b *Backend) ExecutionRequirementRuntime() {}

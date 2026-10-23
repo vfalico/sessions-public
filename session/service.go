@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -106,15 +107,16 @@ func sessionProto(info sqlitelog.SessionInfo) (*v1.Session, error) {
 		md.UpdateTime = timestamppb.New(info.UpdatedAt)
 	}
 	out := &v1.Session{
-		Metadata:      md,
-		Harness:       info.Harness,
-		Model:         info.Model,
-		ExecState:     execStateOf(info),
-		ComputeState:  wire.ComputeStateToProto(info.ComputeState),
-		LastSeq:       info.LastSeq,
-		ParentUid:     info.ParentUID,
-		ForkSeq:       info.ForkSeq,
-		DeletionState: wire.DeletionStateToProto(info.DeletionState),
+		Metadata:             md,
+		Harness:              info.Harness,
+		ExecutionRequirement: []byte(info.ExecutionRequirement),
+		Model:                info.Model,
+		ExecState:            execStateOf(info),
+		ComputeState:         wire.ComputeStateToProto(info.ComputeState),
+		LastSeq:              info.LastSeq,
+		ParentUid:            info.ParentUID,
+		ForkSeq:              info.ForkSeq,
+		DeletionState:        wire.DeletionStateToProto(info.DeletionState),
 	}
 	if !info.DeletionRequestedAt.IsZero() {
 		out.DeletionRequestedTime = timestamppb.New(info.DeletionRequestedAt)
@@ -160,20 +162,24 @@ func (s *Service) CreateSession(ctx context.Context, req *v1.CreateSessionReques
 	defer func() { finish(err, "error_kind", serviceErrorKind(err), "session_uid", uid) }()
 
 	spec := req.GetSession()
+	if raw := spec.GetExecutionRequirement(); len(raw) > 1<<20 || (len(raw) > 0 && !json.Valid(raw)) {
+		return nil, status.Error(codes.InvalidArgument, "malformed complete execution requirement")
+	}
 	labels, annotations, origin, identity, err := metadataFromSpec(spec)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "session metadata: %v", err)
 	}
 	return s.createSession(uid, sqlitelog.SessionMeta{
-		UID:         uid,
-		Project:     spec.GetMetadata().GetProject(),
-		Name:        spec.GetMetadata().GetName(),
-		Harness:     spec.GetHarness(),
-		Model:       spec.GetModel(),
-		Labels:      labels,
-		Annotations: annotations,
-		Origin:      origin,
-		Identity:    identity,
+		UID:                  uid,
+		ExecutionRequirement: string(spec.GetExecutionRequirement()),
+		Project:              spec.GetMetadata().GetProject(),
+		Name:                 spec.GetMetadata().GetName(),
+		Harness:              spec.GetHarness(),
+		Model:                spec.GetModel(),
+		Labels:               labels,
+		Annotations:          annotations,
+		Origin:               origin,
+		Identity:             identity,
 	})
 }
 
@@ -690,6 +696,7 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 	// drive the placed harness through the Runtime SPI instead of a co-located controller.
 	execOpts := []placement.ExecOption{
 		placement.WithHarness(harness),
+		placement.WithExecutionRequirement(sess.GetExecutionRequirement()),
 		placement.WithObserver(observer),
 		placement.WithStart(req.GetConfig(), req.GetResumeFromSeq()),
 	}
@@ -699,6 +706,9 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 	var operationErr error
 	var refused error
 	if recoveryInfo != nil {
+		if len(recoveryInfo.ExecutionRequirement) != 0 {
+			return status.Error(codes.FailedPrecondition, "governed recovery is not supported; no compute resumed")
+		}
 		if d := req.GetDeadlineUnix(); d > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithDeadline(ctx, time.Unix(d, 0))
@@ -838,6 +848,13 @@ func (s *Service) Fork(ctx context.Context, req *v1.ForkRequest) (response *v1.F
 	parent := s.store.Session(req.GetSession())
 	atSeq := req.GetAtSeq()
 	placer, _, _, err := s.placerFor(ctx, req.GetSession(), "", func() error {
+		info, e := s.store.SessionInfo(req.GetSession())
+		if e != nil {
+			return sessionStoreError(e, req.GetSession())
+		}
+		if len(info.ExecutionRequirement) != 0 {
+			return status.Error(codes.FailedPrecondition, "governed fork is not supported; no child created")
+		}
 		if atSeq <= 0 {
 			h, err := parent.Head()
 			if err != nil {
@@ -1022,6 +1039,10 @@ func (s *Service) Resume(ctx context.Context, req *v1.ResumeRequest) (session *v
 	if err := deletedSessionError(info); err != nil {
 		return nil, err
 	}
+	if len(info.ExecutionRequirement) != 0 {
+		return nil, status.Error(codes.FailedPrecondition, "governed resume is not supported; no compute resumed")
+	}
+
 	log := s.store.Session(uid)
 	stored := info.Harness
 	if stored == "" {
