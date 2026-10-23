@@ -19,14 +19,14 @@ import (
 
 // Run the actual ordinary main with stdio, not an alternate test-only server.
 func TestOrdinaryMainStdio(t *testing.T) {
-	if os.Getenv("T807_STDIO_HELPER") == "1" {
+	if os.Getenv("POC_STDIO_HELPER") == "1" {
 		main()
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOrdinaryMainStdio$")
-	cmd.Env = append(os.Environ(), "T807_STDIO_HELPER=1", "RUNTIME_CONTROL_STDIO=1", "HARNESS_KIND=echo", "HARNESS_MODEL_PLACEMENT=")
+	cmd.Env = append(os.Environ(), "POC_STDIO_HELPER=1", "RUNTIME_CONTROL_STDIO=1", "HARNESS_KIND=echo", "HARNESS_MODEL_PLACEMENT=")
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
